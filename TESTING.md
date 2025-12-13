@@ -74,6 +74,49 @@ Connect an Android device or start an emulator, then run:
 ./gradlew connectedDebugAndroidTest
 ```
 
+## Vulkan Support
+
+This project includes optional Vulkan support for improved performance on compatible Android devices. Vulkan support requires generating shader files on the host machine before building the Android app.
+
+### Prerequisites for Vulkan Support
+
+You need the following installed on your system:
+- **Vulkan SDK** (https://vulkan.lunarg.com/sdk/home)
+- **C/C++ compiler**: 
+  - **Windows**: Visual Studio with C++ support, or MinGW-w64, or MSYS2
+  - **Linux**: GCC or Clang (usually pre-installed)
+  - **macOS**: Xcode command line tools
+
+### Generating Vulkan Shaders
+
+#### Option 1: Use the provided scripts (Recommended)
+
+For Windows:
+```bash
+generate_vulkan_shaders.bat
+```
+
+For Linux/macOS:
+```bash
+./generate_vulkan_shaders.sh
+```
+
+#### Option 2: Manual generation
+
+Follow the instructions in `app/src/main/cpp/VULKAN_README.md` to manually generate the Vulkan shaders.
+
+#### Option 3: Use Gradle tasks
+
+```bash
+./gradlew generateVulkanShaders
+```
+
+After generating the shaders, the Android build will automatically enable Vulkan support.
+
+### Testing with Vulkan
+
+When Vulkan support is enabled, the app will automatically use Vulkan on compatible devices. You can verify Vulkan is being used by checking the logs during model initialization.
+
 ## GGUF Model Information
 
 Model location: `app/assets/models/gemma-3-270m-q4_k_s.gguf`
@@ -127,6 +170,7 @@ Common issues when testing with the GGUF model:
 2. **Memory limitations** - Model may require 500MB+ RAM
 3. **Architecture mismatch** - Model compiled for ARM64 only
 4. **File permissions** - Ensure app can read from assets and write to storage
+5. **Vulkan shader generation failures** - Ensure Vulkan SDK and a native compiler are installed
 
 ## Conclusion
 

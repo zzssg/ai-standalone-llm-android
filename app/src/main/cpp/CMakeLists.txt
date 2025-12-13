@@ -18,6 +18,12 @@ set(GGML_CUDA OFF CACHE BOOL "Disable CUDA" FORCE)
 set(GGML_METAL OFF CACHE BOOL "Disable Metal" FORCE)
 set(GGML_VULKAN OFF CACHE BOOL "Disable Vulkan" FORCE)
 set(GGML_BLAS OFF CACHE BOOL "Disable BLAS" FORCE)
+set(GGML_OPENCL OFF CACHE BOOL "Disable OpenCL" FORCE)
+
+# Enable CPU-specific optimized variants (NEON/AArch64) when available so ggml picks optimized kernels
+set(GGML_CPU_ALL_VARIANTS ON CACHE BOOL "Enable CPU optimized kernels (NEON/AArch64)" FORCE)
+# Enable dynamic backend loading (optional) to allow ggml to pick best backend at runtime
+set(GGML_BACKEND_DL ON CACHE BOOL "Enable dynamic ggml backend loading" FORCE)
 
 # Include directories
 include_directories(
@@ -34,7 +40,14 @@ add_subdirectory(${LLAMA_CPP_DIR} llama_cpp_build)
 # Create our wrapper library with a different name
 add_library(
     llama_wrapper SHARED
-    "llama_wrapper.c"
+    "llama_wrapper.cpp"
+)
+
+# Specify include directories for this target
+target_include_directories(llama_wrapper PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib/llama.cpp/ggml/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib/llama.cpp/include
+    ${ANDROID_NDK}/sources/android/native_app_glue
 )
 
 # Link libraries

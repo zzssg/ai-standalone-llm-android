@@ -21,10 +21,37 @@ fun ChatScreen(isMockMode: Boolean = false) {
     var messages by remember { mutableStateOf<List<Message>>(emptyList()) }
     var userInput by remember { mutableStateOf("") }
     var isTyping by remember { mutableStateOf(false) }
+    var systemPrompt by remember { mutableStateOf("You are a helpful AI assistant.") }
 
     // Use LazyListState
     val scrollState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+
+    // Initialize model with parameters when component is first composed
+    LaunchedEffect(Unit) {
+        if (!isMockMode && !LlamaWrapper.nativeIsModelLoaded()) {
+            // Initialize model with the specified parameters:
+            // --threads 6 
+            // --batch_size 64 
+            // --ctx_size 1024 
+            // --temp 0.7 
+            // --top_p 0.9 
+            // --repeat_penalty 1.1
+            val result = LlamaWrapper.nativeInitModelWithParams(
+                "/data/user/0/org.zzssg.llmchatapp/files/model.gguf", // Update with actual model path
+                6,     // threads
+                64,    // batchSize
+                1024,  // ctxSize
+                0.7f,  // temp
+                0.9f,  // topP
+                40,    // topK
+                0.05f, // minP
+                1.1f,  // repeatPenalty
+                true  // flashAttn
+            )
+            println("Model initialization result: $result")
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -32,6 +59,23 @@ fun ChatScreen(isMockMode: Boolean = false) {
             .padding(8.dp),
         verticalArrangement = Arrangement.Bottom
     ) {
+        // System prompt input field
+        TextField(
+            value = systemPrompt,
+            onValueChange = { systemPrompt = it },
+            placeholder = { Text("System prompt (optional)") },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 8.dp),
+            shape = MaterialTheme.shapes.medium,
+            colors = TextFieldDefaults.colors(
+                focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
+            ),
+            textStyle = MaterialTheme.typography.bodySmall,
+            singleLine = true
+        )
+
         // Messages list
         LazyColumn(
             state = scrollState,
@@ -72,12 +116,37 @@ fun ChatScreen(isMockMode: Boolean = false) {
                     userInput = ""
                     isTyping = true
                     
+                    // Combine system prompt with user input
+                    val fullPrompt = if (systemPrompt.isNotBlank()) {
+                        "$systemPrompt\nUser: $currentInput"
+                    } else {
+                        currentInput
+                    }
+                    
                     // Generate AI response
                     scope.launch {
                         try {
-                            val aiResponseText = generateAIResponse(currentInput, isMockMode)
-                            val aiMessage = Message(text = aiResponseText, sender = "ai")
-                            messages = messages + aiMessage
+                            val aiResponseText = generateAIResponse(fullPrompt, isMockMode) { progress ->
+                                // Update the last message with the progress
+                                if (messages.isNotEmpty() && messages.last().sender == "ai") {
+                                    val updatedMessages = messages.toMutableList()
+                                    updatedMessages[updatedMessages.size - 1] = Message(text = progress, sender = "ai")
+                                    messages = updatedMessages
+                                } else {
+                                    // Add a new AI message if there isn't one
+                                    val aiMessage = Message(text = progress, sender = "ai")
+                                    messages = messages + aiMessage
+                                }
+                            }
+                            // Final update with complete message
+                            if (messages.isNotEmpty() && messages.last().sender == "ai") {
+                                val updatedMessages = messages.toMutableList()
+                                updatedMessages[updatedMessages.size - 1] = Message(text = aiResponseText, sender = "ai")
+                                messages = updatedMessages
+                            } else {
+                                val aiMessage = Message(text = aiResponseText, sender = "ai")
+                                messages = messages + aiMessage
+                            }
                         } catch (e: Exception) {
                             val errorMessage = Message(
                                 text = "Error: ${e.message ?: e.javaClass.simpleName}. Please try again or check if the model is properly loaded.",
@@ -111,7 +180,12 @@ fun ChatScreen(isMockMode: Boolean = false) {
     }
 }
 
-suspend fun generateAIResponse(prompt: String, isMockMode: Boolean): String = withContext(Dispatchers.IO) {
+// Modified function to accept a progress callback
+suspend fun generateAIResponse(
+    prompt: String, 
+    isMockMode: Boolean, 
+    onProgress: (String) -> Unit = {}
+): String = withContext(Dispatchers.IO) {
     // If we're in mock mode, return a mock response immediately
     if (isMockMode) {
         delay(1000) // Simulate some processing time
@@ -163,7 +237,8 @@ suspend fun generateAIResponse(prompt: String, isMockMode: Boolean): String = wi
                     }
 
                     override fun onProgress(progress: String) {
-                        // We could update a progress indicator here if needed
+                        // Update UI with progress
+                        onProgress(progress)
                     }
                 }
 

@@ -1,0 +1,9 @@
+gradle/
+.gradle/
+build/
+.vscode/
+.idea/
+app/.cxx/
+app/build/
+app/assets/models/
+app/src/main/assets/models/

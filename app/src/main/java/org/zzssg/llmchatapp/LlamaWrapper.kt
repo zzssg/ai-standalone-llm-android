@@ -12,6 +12,20 @@ class LlamaWrapper {
         external fun nativeInitModel(modelPath: String): String
         
         @JvmStatic
+        external fun nativeInitModelWithParams(
+            modelPath: String,
+            threads: Int,
+            batchSize: Int,
+            ctxSize: Int,
+            temp: Float,
+            topP: Float,
+            topK: Int,
+            minP: Float,
+            repeatPenalty: Float,
+            flashAttn: Boolean
+        ): String
+        
+        @JvmStatic
         external fun nativeGenerate(prompt: String, maxTokens: Int, callback: LlamaCallback)
         
         @JvmStatic

@@ -106,3 +106,141 @@ dependencies {
     debugImplementation "androidx.compose.ui:ui-tooling:1.5.4"
     debugImplementation "androidx.compose.ui:ui-test-manifest:1.5.4"
 }
+
+// ------------------------------------------------------------------
+// Host-side shader generator build and copy (vulkan-shaders-gen)
+// This automates building the host tool and copying generated shader
+// sources into the ggml Vulkan directory so the Android native build
+// can embed them. Runs before `preBuild`.
+def llmCppDir = file('src/main/cpp/lib/llama.cpp')
+def ggmlVulkanDir = file("${llmCppDir}/ggml/src/ggml-vulkan")
+def vulkanShadersDir = file("${ggmlVulkanDir}/vulkan-shaders")
+def hostBuildDir = file("${vulkanShadersDir}/build-host")
+
+// New task to check if Vulkan support is available
+task checkVulkanSupport {
+    description = 'Check if Vulkan support can be enabled'
+    group = 'build'
+    doLast {
+        def vulkanShaderHeader = file("${ggmlVulkanDir}/ggml-vulkan-shaders.hpp")
+        if (vulkanShaderHeader.exists()) {
+            logger.lifecycle("Vulkan shader files found. Vulkan support will be enabled.")
+        } else {
+            logger.lifecycle("Vulkan shader files not found. Vulkan support will be disabled.")
+            logger.lifecycle("To enable Vulkan support, run the generateVulkanShaders task or follow the instructions in VULKAN_README.md")
+        }
+    }
+}
+
+task buildVulkanShadersHost {
+    description = 'Build vulkan-shaders-gen on the host (required to generate embedded shaders)'
+    group = 'build'
+
+    doFirst {
+        hostBuildDir.mkdirs()
+    }
+
+    doLast {
+        try {
+            // Check if cmake is available
+            def result = exec {
+                commandLine 'cmake', '--version'
+                ignoreExitValue = true
+            }
+            
+            if (result.exitValue != 0) {
+                logger.warn("CMake not found. Please install CMake to enable Vulkan support.")
+                return
+            }
+            
+            if (System.getProperty('os.name').toLowerCase().contains('windows')) {
+                // On Windows we expect either cmake in PATH (or use WSL/MSYS). Use cmd to run commands.
+                exec {
+                    workingDir hostBuildDir
+                    commandLine 'cmd', '/c', "cmake -S ${vulkanShadersDir} -B ${hostBuildDir} -DCMAKE_BUILD_TYPE=Release"
+                }
+                exec {
+                    workingDir hostBuildDir
+                    commandLine 'cmd', '/c', "cmake --build ${hostBuildDir} --config Release"
+                }
+            } else {
+                exec {
+                    workingDir hostBuildDir
+                    commandLine 'bash', '-lc', "cmake -S ${vulkanShadersDir} -B ${hostBuildDir} -DCMAKE_BUILD_TYPE=Release"
+                }
+                exec {
+                    workingDir hostBuildDir
+                    commandLine 'bash', '-lc', "cmake --build ${hostBuildDir} --config Release"
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("Failed to build Vulkan shaders host tool: ${e.message}")
+            logger.warn("This may be due to missing CMake or compiler tools. Vulkan support will be disabled.")
+            logger.warn("To enable Vulkan support, please ensure CMake and a native compiler are installed.")
+        }
+    }
+}
+
+task generateVulkanShaders {
+    description = 'Generate Vulkan shaders using the host tool'
+    group = 'build'
+    dependsOn buildVulkanShadersHost
+    
+    doLast {
+        try {
+            // Check if the build was successful by verifying the executable exists
+            def shaderGenExecutable = file("${hostBuildDir}/vulkan-shaders-gen")
+            logger.info("VULKAN SHADERS BIN PATH: " + "${hostBuildDir}/vulkan-shaders-gen")
+            if (!shaderGenExecutable.exists()) {
+                if (System.getProperty('os.name').toLowerCase().contains('windows')) {
+                    shaderGenExecutable = file("${hostBuildDir}/Release/vulkan-shaders-gen.exe")
+                }
+            }
+            
+            if (!shaderGenExecutable.exists()) {
+                logger.warn("Vulkan shader generator executable not found. Build may have failed: ${hostBuildDir}/vulkan-shaders-gen")
+                return
+            }
+            
+            // Run the shader generator to produce the shader files
+            if (System.getProperty('os.name').toLowerCase().contains('windows')) {
+                exec {
+                    workingDir hostBuildDir
+                    commandLine 'cmd', '/c', "${shaderGenExecutable.absolutePath} --out-dir ${hostBuildDir}"
+                }
+            } else {
+                exec {
+                    workingDir hostBuildDir
+                    commandLine 'bash', '-lc', "${shaderGenExecutable.absolutePath} --out-dir ${hostBuildDir}"
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("Failed to run Vulkan shader generator: ${e.message}")
+        }
+    }
+}
+
+task copyVulkanShaders(type: Copy) {
+    description = 'Copy generated ggml Vulkan shader sources into the ggml Vulkan source directory'
+    group = 'build'
+    dependsOn generateVulkanShaders
+    
+    from(ggmlVulkanDir)
+    include 'ggml-vulkan-shaders.*'
+    into vulkanShadersDir
+    
+    doLast {
+        def vulkanShaderHeader = file("${ggmlVulkanDir}/ggml-vulkan-shaders.hpp")
+        if (vulkanShaderHeader.exists()) {
+            logger.lifecycle("Vulkan shader files successfully copied. Vulkan support will be enabled.")
+        } else {
+            logger.warn("Vulkan shader files were not copied. Vulkan support will be disabled.")
+        }
+    }
+}
+
+// Ensure the copy runs before native build / preBuild
+preBuild.dependsOn(copyVulkanShaders)
+
+// Add dependency to check Vulkan support
+preBuild.dependsOn(checkVulkanSupport)
