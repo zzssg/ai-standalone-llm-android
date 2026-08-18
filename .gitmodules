@@ -1,3 +1,13 @@
-[submodule "src/main/cpp/lib/llama.cpp"]
-	path = src/main/cpp/lib/llama.cpp
-	url = https://github.com/ggerganov/llama.cpp.git
+[submodule "app/src/main/cpp/lib/llama.cpp"]
+	path = app/src/main/cpp/lib/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git
+	# This project treats llama.cpp as pristine upstream and never patches it, so
+	# working-tree changes inside the submodule are noise rather than signal. The
+	# one change we do make -- deleting upstream's AGENTS.md and CLAUDE.md, which
+	# are contributor instructions for llama.cpp itself and get picked up by
+	# tooling running in this repository -- would otherwise report the submodule
+	# as dirty on every status.
+	#
+	# Note this also hides genuine local edits to llama.cpp. If you ever need to
+	# patch it, drop this line first so the change stays visible.
+	ignore = dirty

@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"C:/msys64/home/Sergei/ai-standalone-android/app/src/main/cpp/lib/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/build-host/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
