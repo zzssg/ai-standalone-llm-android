@@ -1,246 +1,186 @@
 plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+
+// Signing credentials live outside the repository. When keystore.properties is
+// absent -- on a fresh clone, or in CI without secrets -- the release build
+// simply produces an unsigned APK instead of failing.
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+def keystoreProperties = new Properties()
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
 }
 
 android {
     namespace 'org.zzssg.llmchatapp'
-    compileSdk 34
+    compileSdk 36
+
+    // Pinned so the native build is reproducible across machines. Without this,
+    // AGP silently uses whatever its own default NDK is, which changes on every
+    // AGP upgrade -- and a different NDK means a different libc++ and different
+    // codegen for ggml. If SDK Manager installed a different patch revision,
+    // change this one line to match it exactly.
+    ndkVersion '27.2.12479018'
 
     defaultConfig {
         applicationId "org.zzssg.llmchatapp"
-        minSdk 24
-        targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        // 26 rather than 24: the NDK dropped API 24 support some releases ago,
+        // and llama.cpp's C++17 usage needs a modern libc++ anyway.
+        minSdk 26
+        targetSdk 36
+        versionCode 4
+        versionName "2.2"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
-        
-        // Enable native builds
+
         externalNativeBuild {
             cmake {
                 cppFlags "-std=c++17"
                 arguments "-DANDROID_STL=c++_shared"
+                // Opt in to an ARMv8.2 baseline with
+                //   ./gradlew assembleRelease -PllmCpuArch=armv8.2-a+dotprod+fp16
+                // See the comment in src/main/cpp/CMakeLists.txt for the tradeoff.
+                if (project.hasProperty('llmCpuArch')) {
+                    arguments "-DLLM_CPU_ARCH=${project.property('llmCpuArch')}"
+                }
             }
         }
-        
-        // Specify supported ABIs - only arm64-v8a for simplicity
+
+        // 64-bit ARM only. Every current Android phone is arm64-v8a; adding
+        // armeabi-v7a would double build time for devices that cannot hold a
+        // usable model in memory anyway. The debug variant adds x86_64 on top of
+        // this -- see the buildTypes block.
         ndk {
             abiFilters 'arm64-v8a'
         }
     }
 
-    buildTypes {
+    signingConfigs {
         release {
+            if (keystoreProperties.containsKey('storeFile')) {
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+                // v1 is only needed below API 24; minSdk is 26.
+                enableV1Signing false
+                enableV2Signing true
+                enableV3Signing true
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            // Note: the debug variant compiles ggml without optimisation, which
+            // is roughly an order of magnitude slower per token. Benchmark and
+            // demo with `assembleRelease`, not `assembleDebug`.
             minifyEnabled false
+
+            // x86_64 exists so the app can run on a desktop emulator, which is
+            // how the instrumented tests verify multi-turn behaviour without
+            // physical hardware. AGP unions these with defaultConfig, so debug
+            // builds arm64-v8a + x86_64 while release stays arm64-v8a only.
+            //
+            // Emulator timings are meaningless -- this ABI is for correctness,
+            // never for benchmarking.
+            ndk {
+                abiFilters 'x86_64'
+            }
+        }
+        release {
+            minifyEnabled true
+            shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (keystoreProperties.containsKey('storeFile')) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
+
     kotlinOptions {
-        jvmTarget = '1.8'
+        // Targeting 17 rather than requesting a toolchain: jvmToolchain(17) makes
+        // Gradle demand a JDK 17 specifically, which fails on a machine that only
+        // has a newer JDK. Setting the target instead builds correctly on any
+        // JDK 17 or later, including the 21 that current Android Studio bundles.
+        jvmTarget = '17'
     }
+
     buildFeatures {
         compose true
-        // Enable native builds
-        prefab true
     }
-    composeOptions {
-        kotlinCompilerExtensionVersion '1.5.14'
-    }
-    
-    // Configure native build
+
     externalNativeBuild {
         cmake {
             path file('src/main/cpp/CMakeLists.txt')
             version '3.22.1'
         }
     }
-    
-    // Ensure assets are packaged
-    sourceSets {
-        main {
-            assets.srcDirs = ['src/main/assets']
+
+    packagingOptions {
+        jniLibs {
+            // Loading the shared library straight from the APK saves ~40 MB of
+            // duplicated install footprint on API 23+.
+            useLegacyPackaging false
         }
     }
-    
-    // Specify NDK version
-    ndkVersion "25.1.8937393"
+
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+
+    lint {
+        // ChromeOS wants an x86_64 slice. Shipping arm64 only is deliberate: see
+        // the abiFilters comment above.
+        disable 'ChromeOsAbiSupport'
+        // Treat everything else as blocking, so the next eight-month gap cannot
+        // quietly accumulate correctness warnings.
+        warningsAsErrors true
+        abortOnError true
+        // Dependency-freshness advice is informational and currently blocked on
+        // an AGP/compileSdk 37 upgrade; see the note in the dependencies block.
+        informational 'GradleDependency', 'NewerVersionAvailable', 'AndroidGradlePluginVersion'
+    }
 }
 
 dependencies {
-    implementation 'androidx.core:core-ktx:1.12.0'
-    implementation 'androidx.appcompat:appcompat:1.6.1'
-    implementation 'com.google.android.material:material:1.11.0'
-    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.7.0'
-    implementation 'androidx.activity:activity-compose:1.8.2'
+    // NOTE: androidx lint will report newer versions of everything below. Do not
+    // take that advice piecemeal -- Compose BOM 2026.08.00, core-ktx 1.19.0 and
+    // lifecycle 2.11.0 all declare `compileSdkVersion 37` in their AAR metadata,
+    // and AGP 8.13 caps out at compileSdk 36. Moving up means bumping AGP,
+    // installing the android-37 platform and raising compileSdk, as one change.
+    def composeBom = platform('androidx.compose:compose-bom:2025.09.00')
+    implementation composeBom
+    androidTestImplementation composeBom
 
-    // Jetpack Compose
-    implementation "androidx.compose.ui:ui:1.5.4"
-    implementation "androidx.compose.material3:material3:1.1.2"
-    implementation "androidx.compose.ui:ui-tooling-preview:1.5.4"
-    implementation "androidx.compose.material:material-icons-extended:1.5.4"
+    implementation 'androidx.core:core-ktx:1.17.0'
+    implementation 'androidx.activity:activity-compose:1.11.0'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.9.4'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.9.4'
+    implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.9.4'
 
-    // Coroutines
-    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-tooling-preview'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.compose.material:material-icons-extended'
 
-    // Lottie (typing indicator)
-    implementation 'com.airbnb.android:lottie-compose:6.2.0'
-    
-    // ViewModel and LiveData
-    implementation "androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0"
-    implementation "androidx.lifecycle:lifecycle-runtime-compose:2.7.0"
-    
-    // Testing
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0'
+
     testImplementation 'junit:junit:4.13.2'
-    testImplementation 'org.mockito:mockito-core:5.7.0'
-    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
-    androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
-    androidTestImplementation 'androidx.test:runner:1.5.2'
-    androidTestImplementation 'androidx.test:rules:1.5.0'
-    androidTestImplementation "androidx.compose.ui:ui-test-junit4:1.5.4"
-    debugImplementation "androidx.compose.ui:ui-tooling:1.5.4"
-    debugImplementation "androidx.compose.ui:ui-test-manifest:1.5.4"
+    testImplementation 'org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0'
+
+    androidTestImplementation 'androidx.test.ext:junit:1.3.0'
+    androidTestImplementation 'androidx.test:runner:1.7.0'
+    androidTestImplementation 'androidx.test:rules:1.7.0'
+    androidTestImplementation 'androidx.compose.ui:ui-test-junit4'
+
+    debugImplementation 'androidx.compose.ui:ui-tooling'
+    debugImplementation 'androidx.compose.ui:ui-test-manifest'
 }
-
-// ------------------------------------------------------------------
-// Host-side shader generator build and copy (vulkan-shaders-gen)
-// This automates building the host tool and copying generated shader
-// sources into the ggml Vulkan directory so the Android native build
-// can embed them. Runs before `preBuild`.
-def llmCppDir = file('src/main/cpp/lib/llama.cpp')
-def ggmlVulkanDir = file("${llmCppDir}/ggml/src/ggml-vulkan")
-def vulkanShadersDir = file("${ggmlVulkanDir}/vulkan-shaders")
-def hostBuildDir = file("${vulkanShadersDir}/build-host")
-
-// New task to check if Vulkan support is available
-task checkVulkanSupport {
-    description = 'Check if Vulkan support can be enabled'
-    group = 'build'
-    doLast {
-        def vulkanShaderHeader = file("${ggmlVulkanDir}/ggml-vulkan-shaders.hpp")
-        if (vulkanShaderHeader.exists()) {
-            logger.lifecycle("Vulkan shader files found. Vulkan support will be enabled.")
-        } else {
-            logger.lifecycle("Vulkan shader files not found. Vulkan support will be disabled.")
-            logger.lifecycle("To enable Vulkan support, run the generateVulkanShaders task or follow the instructions in VULKAN_README.md")
-        }
-    }
-}
-
-task buildVulkanShadersHost {
-    description = 'Build vulkan-shaders-gen on the host (required to generate embedded shaders)'
-    group = 'build'
-
-    doFirst {
-        hostBuildDir.mkdirs()
-    }
-
-    doLast {
-        try {
-            // Check if cmake is available
-            def result = exec {
-                commandLine 'cmake', '--version'
-                ignoreExitValue = true
-            }
-            
-            if (result.exitValue != 0) {
-                logger.warn("CMake not found. Please install CMake to enable Vulkan support.")
-                return
-            }
-            
-            if (System.getProperty('os.name').toLowerCase().contains('windows')) {
-                // On Windows we expect either cmake in PATH (or use WSL/MSYS). Use cmd to run commands.
-                exec {
-                    workingDir hostBuildDir
-                    commandLine 'cmd', '/c', "cmake -S ${vulkanShadersDir} -B ${hostBuildDir} -DCMAKE_BUILD_TYPE=Release"
-                }
-                exec {
-                    workingDir hostBuildDir
-                    commandLine 'cmd', '/c', "cmake --build ${hostBuildDir} --config Release"
-                }
-            } else {
-                exec {
-                    workingDir hostBuildDir
-                    commandLine 'bash', '-lc', "cmake -S ${vulkanShadersDir} -B ${hostBuildDir} -DCMAKE_BUILD_TYPE=Release"
-                }
-                exec {
-                    workingDir hostBuildDir
-                    commandLine 'bash', '-lc', "cmake --build ${hostBuildDir} --config Release"
-                }
-            }
-        } catch (Exception e) {
-            logger.warn("Failed to build Vulkan shaders host tool: ${e.message}")
-            logger.warn("This may be due to missing CMake or compiler tools. Vulkan support will be disabled.")
-            logger.warn("To enable Vulkan support, please ensure CMake and a native compiler are installed.")
-        }
-    }
-}
-
-task generateVulkanShaders {
-    description = 'Generate Vulkan shaders using the host tool'
-    group = 'build'
-    dependsOn buildVulkanShadersHost
-    
-    doLast {
-        try {
-            // Check if the build was successful by verifying the executable exists
-            def shaderGenExecutable = file("${hostBuildDir}/vulkan-shaders-gen")
-            logger.info("VULKAN SHADERS BIN PATH: " + "${hostBuildDir}/vulkan-shaders-gen")
-            if (!shaderGenExecutable.exists()) {
-                if (System.getProperty('os.name').toLowerCase().contains('windows')) {
-                    shaderGenExecutable = file("${hostBuildDir}/Release/vulkan-shaders-gen.exe")
-                }
-            }
-            
-            if (!shaderGenExecutable.exists()) {
-                logger.warn("Vulkan shader generator executable not found. Build may have failed: ${hostBuildDir}/vulkan-shaders-gen")
-                return
-            }
-            
-            // Run the shader generator to produce the shader files
-            if (System.getProperty('os.name').toLowerCase().contains('windows')) {
-                exec {
-                    workingDir hostBuildDir
-                    commandLine 'cmd', '/c', "${shaderGenExecutable.absolutePath} --out-dir ${hostBuildDir}"
-                }
-            } else {
-                exec {
-                    workingDir hostBuildDir
-                    commandLine 'bash', '-lc', "${shaderGenExecutable.absolutePath} --out-dir ${hostBuildDir}"
-                }
-            }
-        } catch (Exception e) {
-            logger.warn("Failed to run Vulkan shader generator: ${e.message}")
-        }
-    }
-}
-
-task copyVulkanShaders(type: Copy) {
-    description = 'Copy generated ggml Vulkan shader sources into the ggml Vulkan source directory'
-    group = 'build'
-    dependsOn generateVulkanShaders
-    
-    from(ggmlVulkanDir)
-    include 'ggml-vulkan-shaders.*'
-    into vulkanShadersDir
-    
-    doLast {
-        def vulkanShaderHeader = file("${ggmlVulkanDir}/ggml-vulkan-shaders.hpp")
-        if (vulkanShaderHeader.exists()) {
-            logger.lifecycle("Vulkan shader files successfully copied. Vulkan support will be enabled.")
-        } else {
-            logger.warn("Vulkan shader files were not copied. Vulkan support will be disabled.")
-        }
-    }
-}
-
-// Ensure the copy runs before native build / preBuild
-preBuild.dependsOn(copyVulkanShaders)
-
-// Add dependency to check Vulkan support
-preBuild.dependsOn(checkVulkanSupport)

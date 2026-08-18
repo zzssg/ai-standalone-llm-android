@@ -1,0 +1,405 @@
+package org.zzssg.llmchatapp.ui
+
+import android.app.Application
+import android.net.Uri
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import org.zzssg.llmchatapp.data.AppSettings
+import org.zzssg.llmchatapp.data.ImportProgress
+import org.zzssg.llmchatapp.data.ModelFile
+import org.zzssg.llmchatapp.data.ModelStore
+import org.zzssg.llmchatapp.data.SettingsStore
+import org.zzssg.llmchatapp.llm.ChatTurn
+import org.zzssg.llmchatapp.llm.GenerationEvent
+import org.zzssg.llmchatapp.llm.LlamaEngine
+import org.zzssg.llmchatapp.llm.LlamaException
+import org.zzssg.llmchatapp.llm.LoadedModel
+import org.zzssg.llmchatapp.ui.components.THINK_CLOSE
+import org.zzssg.llmchatapp.ui.components.THINK_OPEN
+import java.util.Locale
+import java.util.UUID
+
+/** One bubble in the transcript. */
+data class ChatMessage(
+    val id: String = UUID.randomUUID().toString(),
+    val role: String,
+    val text: String,
+    /** True while tokens are still arriving for this message. */
+    val streaming: Boolean = false,
+    /** Set on the assistant message once generation ends. */
+    val stats: GenerationStats? = null,
+) {
+    val isUser: Boolean get() = role == ChatTurn.ROLE_USER
+}
+
+data class GenerationStats(val tokenCount: Int, val elapsedMs: Long) {
+    val tokensPerSecond: Double =
+        if (elapsedMs > 0) tokenCount * 1000.0 / elapsedMs else 0.0
+
+    /**
+     * How long the reply took, in the coarsest unit that still reads precisely:
+     * sub-second in milliseconds, minutes once a reply runs that long. On-device
+     * generation regularly crosses all three ranges depending on model size.
+     */
+    val formattedDuration: String
+        get() = when {
+            elapsedMs < 1_000 -> "$elapsedMs ms"
+            elapsedMs < 60_000 -> String.format(Locale.US, "%.1f s", elapsedMs / 1000.0)
+            else -> String.format(
+                Locale.US,
+                "%d:%02d min",
+                elapsedMs / 60_000,
+                (elapsedMs % 60_000) / 1000,
+            )
+        }
+}
+
+/** What the model manager sheet is currently doing. */
+sealed interface ModelUiState {
+    data object Idle : ModelUiState
+    data class Importing(val fraction: Float?, val copied: Long, val total: Long) : ModelUiState
+    data class Loading(val name: String) : ModelUiState
+}
+
+data class ChatUiState(
+    val messages: List<ChatMessage> = emptyList(),
+    val models: List<ModelFile> = emptyList(),
+    val activeModel: LoadedModel? = null,
+    val modelState: ModelUiState = ModelUiState.Idle,
+    val isGenerating: Boolean = false,
+    val settings: AppSettings = AppSettings(),
+    val error: UserFacingError? = null,
+    val nativeAvailable: Boolean = true,
+) {
+    val isReady: Boolean get() = activeModel != null
+    val isBusy: Boolean get() = modelState != ModelUiState.Idle
+}
+
+/** An error phrased for a person, with an optional recovery action. */
+data class UserFacingError(
+    val title: String,
+    val detail: String,
+    val retryable: Boolean = false,
+)
+
+class ChatViewModel(app: Application) : AndroidViewModel(app) {
+
+    private val engine = LlamaEngine()
+    private val modelStore = ModelStore(app)
+    private val settingsStore = SettingsStore(app)
+
+    private val _state = MutableStateFlow(ChatUiState())
+    val state: StateFlow<ChatUiState> = _state.asStateFlow()
+
+    private var generationJob: Job? = null
+
+    init {
+        val settings = settingsStore.load()
+        _state.update { it.copy(settings = settings, nativeAvailable = engine.isAvailable) }
+        refreshModels(autoLoadId = settings.lastModelId)
+    }
+
+    // -- Model library ------------------------------------------------------
+
+    fun refreshModels(autoLoadId: String? = null) {
+        viewModelScope.launch {
+            val models = modelStore.list()
+            _state.update { it.copy(models = models) }
+
+            // Reopen the model from last session so returning users land straight
+            // in a usable chat instead of on a picker.
+            if (autoLoadId != null && _state.value.activeModel == null) {
+                models.firstOrNull { it.id == autoLoadId }?.let { activate(it) }
+            }
+        }
+    }
+
+    fun importModel(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                modelStore.import(uri).collect { progress ->
+                    when (progress) {
+                        is ImportProgress.Copying -> _state.update {
+                            it.copy(
+                                modelState = ModelUiState.Importing(
+                                    progress.fraction,
+                                    progress.bytesCopied,
+                                    progress.totalBytes,
+                                )
+                            )
+                        }
+
+                        is ImportProgress.Finished -> {
+                            _state.update { it.copy(modelState = ModelUiState.Idle) }
+                            refreshModels()
+                            activate(progress.model)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(
+                        modelState = ModelUiState.Idle,
+                        error = UserFacingError("Could not import the model", e.readableMessage()),
+                    )
+                }
+            }
+        }
+    }
+
+    /** Loads [model] into the engine and makes it the active one. */
+    fun activate(model: ModelFile) {
+        if (_state.value.isBusy) return
+        viewModelScope.launch {
+            stopGeneration()
+            _state.update {
+                it.copy(modelState = ModelUiState.Loading(model.displayName), error = null)
+            }
+            try {
+                val settings = _state.value.settings
+                val loaded = engine.load(
+                    file = model.file,
+                    threads = settings.threads,
+                    contextSize = settings.contextSize,
+                )
+                engine.applySampling(settings.sampling)
+
+                val updatedSettings = settings.copy(lastModelId = model.id)
+                settingsStore.save(updatedSettings)
+
+                _state.update {
+                    it.copy(
+                        activeModel = loaded,
+                        modelState = ModelUiState.Idle,
+                        settings = updatedSettings,
+                        // A different model means a different tokenizer and
+                        // template, so the old transcript is not replayable.
+                        messages = emptyList(),
+                    )
+                }
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(
+                        modelState = ModelUiState.Idle,
+                        activeModel = null,
+                        error = UserFacingError(
+                            // An unsupported architecture is not a transient
+                            // failure, so it gets its own title rather than the
+                            // generic one -- retrying would only fail again.
+                            title = if ((e as? LlamaException)?.code == "E_ARCH") {
+                                "This model is not supported"
+                            } else {
+                                "Could not open the model"
+                            },
+                            detail = e.readableMessage(),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun deleteModel(model: ModelFile) {
+        viewModelScope.launch {
+            if (_state.value.activeModel?.file == model.file) {
+                stopGeneration()
+                engine.unload()
+                _state.update { it.copy(activeModel = null, messages = emptyList()) }
+            }
+            modelStore.delete(model)
+            refreshModels()
+        }
+    }
+
+    // -- Conversation -------------------------------------------------------
+
+    fun send(text: String) {
+        val prompt = text.trim()
+        if (prompt.isEmpty() || _state.value.isGenerating || !_state.value.isReady) return
+
+        val userMessage = ChatMessage(role = ChatTurn.ROLE_USER, text = prompt)
+        val placeholder = ChatMessage(role = ChatTurn.ROLE_ASSISTANT, text = "", streaming = true)
+
+        _state.update {
+            it.copy(
+                messages = it.messages + userMessage + placeholder,
+                isGenerating = true,
+                error = null,
+            )
+        }
+
+        val turns = buildTurns()
+        val config = _state.value.settings.sampling
+
+        generationJob = viewModelScope.launch {
+            val builder = StringBuilder()
+            try {
+                engine.generate(turns, config).collect { event ->
+                    when (event) {
+                        is GenerationEvent.Token -> {
+                            builder.append(event.text)
+                            updateMessage(placeholder.id) { it.copy(text = builder.toString()) }
+                        }
+
+                        is GenerationEvent.Done -> updateMessage(placeholder.id) {
+                            it.copy(
+                                text = builder.toString(),
+                                streaming = false,
+                                stats = GenerationStats(event.tokenCount, event.elapsedMs),
+                            )
+                        }
+                    }
+                }
+            } catch (e: CancellationException) {
+                // The user pressed Stop, or the ViewModel is going away. Not an
+                // error -- and it must be rethrown so the coroutine really ends.
+                updateMessage(placeholder.id) { it.copy(text = builder.toString(), streaming = false) }
+                throw e
+            } catch (e: Exception) {
+                // Keep whatever streamed in before the failure; discarding it
+                // loses work the user already watched appear.
+                updateMessage(placeholder.id) { it.copy(streaming = false) }
+                if (builder.isEmpty()) {
+                    _state.update { s -> s.copy(messages = s.messages.filterNot { it.id == placeholder.id }) }
+                }
+                _state.update {
+                    it.copy(
+                        error = UserFacingError(
+                            title = "The model could not answer",
+                            detail = e.readableMessage(),
+                            retryable = true,
+                        )
+                    )
+                }
+            } finally {
+                _state.update { it.copy(isGenerating = false) }
+            }
+        }
+    }
+
+    /** Stops the in-flight reply, keeping the partial text. */
+    fun stopGeneration() {
+        engine.stop()
+        generationJob?.cancel()
+        generationJob = null
+        _state.update { state ->
+            state.copy(
+                isGenerating = false,
+                messages = state.messages.map { if (it.streaming) it.copy(streaming = false) else it },
+            )
+        }
+    }
+
+    /** Re-runs the last user message. Available after an error or a stop. */
+    fun retryLast() {
+        val lastUser = _state.value.messages.lastOrNull { it.isUser } ?: return
+        _state.update { state ->
+            val cutoff = state.messages.indexOfLast { it.id == lastUser.id }
+            state.copy(messages = state.messages.take(cutoff), error = null)
+        }
+        send(lastUser.text)
+    }
+
+    fun newConversation() {
+        viewModelScope.launch {
+            stopGeneration()
+            engine.resetSession()
+            _state.update { it.copy(messages = emptyList(), error = null) }
+        }
+    }
+
+    // -- Settings -----------------------------------------------------------
+
+    fun updateSettings(settings: AppSettings) {
+        val previous = _state.value.settings
+        settingsStore.save(settings)
+        _state.update { it.copy(settings = settings) }
+
+        viewModelScope.launch {
+            runCatching { engine.applySampling(settings.sampling) }
+
+            // Context size and thread count are baked into the llama_context, so
+            // they only take effect after a reload.
+            val needsReload = settings.contextSize != previous.contextSize ||
+                settings.threads != previous.threads
+            if (needsReload) {
+                _state.value.models
+                    .firstOrNull { it.id == _state.value.activeModel?.file?.name }
+                    ?.let { activate(it) }
+            }
+        }
+    }
+
+    fun dismissError() = _state.update { it.copy(error = null) }
+
+    // -- Internals ----------------------------------------------------------
+
+    /**
+     * The conversation as the model should see it: the system prompt plus every
+     * completed turn. The empty streaming placeholder is excluded so the template
+     * ends with the assistant-turn opener rather than a blank assistant message.
+     */
+    private fun buildTurns(): List<ChatTurn> = buildList {
+        val systemPrompt = _state.value.settings.systemPrompt.trim()
+        if (systemPrompt.isNotEmpty()) {
+            add(ChatTurn(ChatTurn.ROLE_SYSTEM, systemPrompt))
+        }
+        _state.value.messages
+            .map { it.role to if (it.isUser) it.text else it.text.withoutReasoning() }
+            .filter { (_, text) -> text.isNotBlank() }
+            .forEach { (role, text) -> add(ChatTurn(role, text)) }
+    }
+
+    private fun updateMessage(id: String, transform: (ChatMessage) -> ChatMessage) {
+        _state.update { state ->
+            state.copy(messages = state.messages.map { if (it.id == id) transform(it) else it })
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        // Releasing here rather than in Activity.onDestroy is what makes a screen
+        // rotation survivable: the ViewModel outlives the Activity, so a model
+        // that took thirty seconds to load is no longer thrown away on rotate.
+        engine.releaseAsync()
+    }
+}
+
+/**
+ * Drops `<think>` blocks from an assistant turn before it is replayed.
+ *
+ * Reasoning models are trained to see only their own *answers* in the history,
+ * not their scratchpads -- their own chat templates strip prior thinking. Sending
+ * it back wastes context and degrades the next reply.
+ */
+private fun String.withoutReasoning(): String {
+    if (!contains(THINK_OPEN)) return this
+
+    val out = StringBuilder()
+    var index = 0
+    while (index < length) {
+        val open = indexOf(THINK_OPEN, index)
+        if (open < 0) {
+            out.append(this, index, length)
+            break
+        }
+        out.append(this, index, open)
+        val close = indexOf(THINK_CLOSE, open + THINK_OPEN.length)
+        // An unterminated block means the whole tail is reasoning.
+        if (close < 0) break
+        index = close + THINK_CLOSE.length
+    }
+    return out.toString().trim()
+}
+
+private fun Throwable.readableMessage(): String = when (this) {
+    is LlamaException -> message ?: "Unknown engine error ($code)."
+    else -> message ?: this::class.java.simpleName
+}

@@ -1,21 +1,31 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
+# --- JNI boundary -----------------------------------------------------------
 #
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# The native library resolves these by name at runtime, so R8 must not rename
+# or remove them. Getting this wrong produces an app that works in debug and
+# throws UnsatisfiedLinkError the moment it is built for release.
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# LlamaBridge is the @file:JvmName facade holding the static native methods.
+# Its name is baked into every Java_org_zzssg_llmchatapp_llm_LlamaBridge_*
+# symbol in llama_wrapper.cpp.
+-keep class org.zzssg.llmchatapp.llm.LlamaBridge { *; }
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# Any method the native side may call back into.
+-keepclasseswithmembernames class * {
+    native <methods>;
+}
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# llama_wrapper.cpp looks these up with GetMethodID by exact name and
+# signature, on whatever concrete class implements the interface.
+-keep interface org.zzssg.llmchatapp.llm.TokenSink { *; }
+-keep class * implements org.zzssg.llmchatapp.llm.TokenSink {
+    void onToken(java.lang.String);
+    void onDone(int, long);
+    void onError(java.lang.String);
+}
+
+# --- Diagnostics ------------------------------------------------------------
+
+# Keep line numbers so release crash reports stay readable, while still hiding
+# the original source file names.
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile

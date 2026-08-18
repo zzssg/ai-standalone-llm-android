@@ -1,20 +1,36 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <!--
+        No permissions are declared on purpose.
+
+        Models are picked through the Storage Access Framework, which grants
+        per-document access without READ_EXTERNAL_STORAGE (the old manifest
+        requested that permission but never used it, and on API 33+ it does
+        nothing anyway). There is no INTERNET permission either, which is the
+        strongest possible guarantee that conversations never leave the device.
+
+        Backup is off because the app's data directory holds multi-gigabyte model
+        files that must not be pushed into cloud backup. allowBackup covers
+        every version; the two rule files simply make the intent explicit for
+        API 26-31 (fullBackupContent) and API 31+ (dataExtractionRules).
+    -->
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.Aistandaloneandroid">
-        
+        android:theme="@style/Theme.LlmChat">
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:theme="@style/Theme.Aistandaloneandroid">
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.LlmChat">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

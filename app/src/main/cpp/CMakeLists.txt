@@ -4,59 +4,75 @@ project(llama_android LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Android NDK path (auto-detected by AS)
 find_library(log-lib log)
 
-# Set the path to the llama.cpp library
 set(LLAMA_CPP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/lib/llama.cpp)
 
-# Disable some features that might cause compilation issues
-set(GGML_OPENMP OFF CACHE BOOL "Disable OpenMP" FORCE)
-set(GGML_LLAMAFILE OFF CACHE BOOL "Disable llamafile" FORCE)
-set(GGML_CUDA OFF CACHE BOOL "Disable CUDA" FORCE)
-set(GGML_METAL OFF CACHE BOOL "Disable Metal" FORCE)
-set(GGML_VULKAN OFF CACHE BOOL "Disable Vulkan" FORCE)
-set(GGML_BLAS OFF CACHE BOOL "Disable BLAS" FORCE)
-set(GGML_OPENCL OFF CACHE BOOL "Disable OpenCL" FORCE)
+# --- llama.cpp / ggml configuration -------------------------------------------
+# Keep the build lean: no tools, tests or examples in the APK build.
+set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
+# LLAMA_CURL is deprecated upstream; networking is pulled in via these instead,
+# and none of them belong in an app that declares no INTERNET permission.
+set(LLAMA_BUILD_APP      OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_UI       OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_MTMD     OFF CACHE BOOL "" FORCE)
+set(LLAMA_OPENSSL        OFF CACHE BOOL "" FORCE)
 
-# Enable CPU-specific optimized variants (NEON/AArch64) when available so ggml picks optimized kernels
-set(GGML_CPU_ALL_VARIANTS ON CACHE BOOL "Enable CPU optimized kernels (NEON/AArch64)" FORCE)
-# Enable dynamic backend loading (optional) to allow ggml to pick best backend at runtime
-set(GGML_BACKEND_DL ON CACHE BOOL "Enable dynamic ggml backend loading" FORCE)
+# Backends we do not ship on Android.
+set(GGML_OPENMP    OFF CACHE BOOL "" FORCE)
+set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
+set(GGML_CUDA      OFF CACHE BOOL "" FORCE)
+set(GGML_METAL     OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN    OFF CACHE BOOL "" FORCE)
+set(GGML_BLAS      OFF CACHE BOOL "" FORCE)
+set(GGML_OPENCL    OFF CACHE BOOL "" FORCE)
 
-# Include directories
-include_directories(
-    ${LLAMA_CPP_DIR}/include
-    ${LLAMA_CPP_DIR}/src
-    ${LLAMA_CPP_DIR}/common
-    ${LLAMA_CPP_DIR}/ggml/include
-    ${LLAMA_CPP_DIR}/ggml/src
-)
+# IMPORTANT: the CPU backend must be linked directly into libllama.so.
+#
+# GGML_BACKEND_DL builds each backend as a CMake MODULE (libggml-cpu-*.so) that is
+# discovered at runtime with dlopen() from `get_executable_path()`. On Android that
+# path resolves to the dir of /proc/self/exe, i.e. /system/bin/app_process64 --
+# never the APK's lib/<abi> dir -- so ggml_backend_load_all() finds nothing and the
+# app ends up with zero compute backends. GGML_BACKEND_DL also hard-requires
+# BUILD_SHARED_LIBS, which AGP leaves OFF, so the configure step fails outright.
+# GGML_CPU_ALL_VARIANTS in turn requires GGML_BACKEND_DL, so both must stay OFF.
+set(GGML_BACKEND_DL       OFF CACHE BOOL "" FORCE)
+set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
+set(GGML_NATIVE           OFF CACHE BOOL "" FORCE)
 
-# Add llama.cpp as a subdirectory with a different name to avoid conflicts
+# Optional CPU feature baseline.
+#
+# `armv8.2-a+dotprod+fp16` roughly doubles throughput on Q4_K kernels, but those
+# instructions are NOT universal on arm64 -- pre-2018 SoCs (Cortex-A53/A57, e.g.
+# Snapdragon 835) will SIGILL. With minSdk 24 we keep the portable armv8-a
+# baseline by default and let the build opt in explicitly:
+#
+#   ./gradlew assembleRelease -PllmCpuArch=armv8.2-a+dotprod+fp16
+#
+# (see android.defaultConfig.externalNativeBuild.cmake.arguments in app/build.gradle)
+if (LLM_CPU_ARCH)
+    set(GGML_CPU_ARM_ARCH "${LLM_CPU_ARCH}" CACHE STRING "" FORCE)
+    message(STATUS "llama_wrapper: using CPU arch baseline ${LLM_CPU_ARCH}")
+endif()
+
 add_subdirectory(${LLAMA_CPP_DIR} llama_cpp_build)
 
-# Create our wrapper library with a different name
-add_library(
-    llama_wrapper SHARED
-    "llama_wrapper.cpp"
-)
+add_library(llama_wrapper SHARED llama_wrapper.cpp)
 
-# Specify include directories for this target
 target_include_directories(llama_wrapper PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/lib/llama.cpp/ggml/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/lib/llama.cpp/include
-    ${ANDROID_NDK}/sources/android/native_app_glue
+    ${LLAMA_CPP_DIR}/include
+    ${LLAMA_CPP_DIR}/ggml/include
 )
 
-# Link libraries
-target_link_libraries(
-    llama_wrapper
+target_link_libraries(llama_wrapper
     android
     ${log-lib}
     llama
 )
 
-# Ensure proper C++17 support
 set_target_properties(llama_wrapper PROPERTIES CXX_STANDARD 17)

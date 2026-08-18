@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <!--
+        Nothing is backed up or transferred. filesDir/models holds multi-gigabyte
+        GGUF files, and conversations are private by the same principle that keeps
+        the INTERNET permission out of the manifest.
+    -->
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="shared_pref" />
+        <exclude domain="external" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="shared_pref" />
+        <exclude domain="external" />
+    </device-transfer>
+</data-extraction-rules>
