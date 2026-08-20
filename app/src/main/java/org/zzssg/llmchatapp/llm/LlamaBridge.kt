@@ -74,6 +74,12 @@ external fun nativeSetSampling(
 /** Draft depth actually in use, or 0 when MTP is unavailable or disabled. */
 external fun nativeMtpDraft(): Int
 
+/** Parameter count of the loaded model. */
+external fun nativeModelParams(): Long
+
+/** Whether the model ships an MTP block, whether or not it was loaded. */
+external fun nativeHasMtpBlock(): Boolean
+
 /** True when the loaded model marks its reasoning with `<think>` blocks. */
 external fun nativeSupportsThinking(): Boolean
 

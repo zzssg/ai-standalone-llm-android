@@ -214,6 +214,147 @@ size_t utf8_safe_len(const std::string & s) {
     return n;
 }
 
+
+// ---------------------------------------------------------------------------
+// Multi-token prediction
+// ---------------------------------------------------------------------------
+
+// A batch that carries tokens *and* hidden states.
+//
+// llama_batch_init allocates one or the other, never both, but the MTP head is
+// fed a token together with the hidden state that preceded it. The reference
+// implementation in common/speculative.cpp works around this the same way.
+struct mtp_batch {
+    llama_batch batch{};
+    bool token_owned = false;
+
+    void init(int32_t capacity, int32_t n_embd) {
+        batch = llama_batch_init(capacity, n_embd, /*n_seq_max=*/ 1);
+        batch.token = (llama_token *) malloc(sizeof(llama_token) * (size_t) capacity);
+        token_owned = batch.token != nullptr;
+    }
+
+    void free() {
+        if (token_owned && batch.token) {
+            ::free(batch.token);
+            batch.token = nullptr;
+        }
+        token_owned = false;
+        llama_batch_free(batch);
+        batch = llama_batch{};
+    }
+
+    void clear() { batch.n_tokens = 0; }
+
+    void add(llama_token id, llama_pos pos, const float * h, int32_t n_embd, bool logits) {
+        const int32_t i = batch.n_tokens;
+        batch.token[i]     = id;
+        batch.pos[i]       = pos;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = logits;
+        std::memcpy(batch.embd + (size_t) i * n_embd, h, (size_t) n_embd * sizeof(float));
+        batch.n_tokens = i + 1;
+    }
+};
+
+// Mirrors the target's decode into the draft head.
+//
+// The MTP head predicts the token after next, so it pairs the hidden state at
+// position p with the token at p+1: the hidden rows are shifted right by one and
+// the gap at the front is filled from the previous call. That carryover is the
+// whole reason g_mtp_pending_h exists -- the last row of one decode has no
+// partner until the next decode supplies it.
+bool mtp_follow_target(const std::vector<llama_token> & tokens, int pos0) {
+    if (!g_ctx_mtp || tokens.empty()) return false;
+
+    const int32_t n_embd = g_mtp_n_embd;
+    const size_t  row_bytes = (size_t) n_embd * sizeof(float);
+    const int32_t n = (int32_t) tokens.size();
+
+    mtp_batch mb;
+    mb.init(n, n_embd);
+    if (!mb.token_owned) { mb.free(); return false; }
+
+    const float * h_tgt = llama_get_embeddings_nextn(g_ctx);
+    if (!h_tgt) { mb.free(); return false; }
+
+    for (int32_t i = 0; i < n; ++i) {
+        const float * h = (i == 0) ? g_mtp_pending_h.data() : (h_tgt + (size_t) (i - 1) * n_embd);
+        mb.add(tokens[(size_t) i], pos0 + i, h, n_embd, /*logits=*/ false);
+    }
+
+    const int rc = llama_decode(g_ctx_mtp, mb.batch);
+    mb.free();
+    if (rc != 0) {
+        LOGW("MTP follow decode failed rc=%d", rc);
+        return false;
+    }
+
+    // Keep the target's rows: which one becomes the next carryover depends on
+    // how many drafted tokens survive verification, and that is not known yet.
+    g_mtp_verify_rows = n;
+    g_mtp_verify_h.resize((size_t) n * n_embd);
+    for (int32_t i = 0; i < n; ++i) {
+        const float * h = llama_get_embeddings_nextn_ith(g_ctx, i);
+        if (!h) { g_mtp_verify_rows = 0; return false; }
+        std::memcpy(g_mtp_verify_h.data() + (size_t) i * n_embd, h, row_bytes);
+    }
+    std::memcpy(g_mtp_pending_h.data(),
+                g_mtp_verify_h.data() + (size_t) (n - 1) * n_embd, row_bytes);
+    return true;
+}
+
+// Once verification is done, the carryover is the hidden row belonging to the
+// last token that survived.
+void mtp_commit(int n_accepted) {
+    if (g_mtp_verify_rows <= 0) return;
+    const int i = std::min(n_accepted, g_mtp_verify_rows - 1);
+    std::memcpy(g_mtp_pending_h.data(),
+                g_mtp_verify_h.data() + (size_t) i * g_mtp_n_embd,
+                (size_t) g_mtp_n_embd * sizeof(float));
+}
+
+// Runs the draft head forward to guess up to g_mtp_draft tokens.
+//
+// Greedy on purpose: a draft is a guess that the target will confirm or throw
+// away, so spending sampling variety on it only lowers the acceptance rate.
+std::vector<llama_token> mtp_draft_tokens(llama_token id_last, int n_past) {
+    std::vector<llama_token> draft;
+    if (!g_ctx_mtp || g_mtp_draft <= 0) return draft;
+
+    const int32_t n_embd = g_mtp_n_embd;
+
+    mtp_batch mb;
+    mb.init(1, n_embd);
+    if (!mb.token_owned) { mb.free(); return draft; }
+
+    llama_sampler * greedy = llama_sampler_init_greedy();
+    if (!greedy) { mb.free(); return draft; }
+
+    std::vector<float> h(g_mtp_pending_h);
+
+    for (int i = 0; i < g_mtp_draft; ++i) {
+        mb.clear();
+        const llama_token id = draft.empty() ? id_last : draft.back();
+        mb.add(id, n_past + i, h.data(), n_embd, /*logits=*/ true);
+
+        if (llama_decode(g_ctx_mtp, mb.batch) != 0) break;
+
+        const llama_token next = llama_sampler_sample(greedy, g_ctx_mtp, 0);
+        if (next < 0) break;
+        draft.push_back(next);
+
+        const float * h_row = llama_get_embeddings_nextn_ith(g_ctx_mtp, 0);
+        if (!h_row) break;
+        h.assign(h_row, h_row + n_embd);
+    }
+
+    llama_sampler_free(greedy);
+    mb.free();
+    return draft;
+}
+
 // ---------------------------------------------------------------------------
 // Callback plumbing
 // ---------------------------------------------------------------------------
@@ -333,7 +474,10 @@ std::string token_to_piece(const llama_vocab * vocab, llama_token id) {
 // Feed `tokens` starting at position `pos0`, split into n_batch-sized chunks.
 // llama_decode rejects any batch larger than the context's logical batch size,
 // which is what made long prompts fail with "Failed to process prompt".
-bool decode_tokens(const std::vector<llama_token> & tokens, int pos0, bool logits_on_last) {
+// `logits_on_all` is what speculative decoding needs: every position in the run
+// has to be checkable, not just the final one.
+bool decode_tokens(const std::vector<llama_token> & tokens, int pos0, bool logits_on_last,
+                   bool logits_on_all = false) {
     const int total = (int) tokens.size();
     if (total == 0) return true;
 
@@ -350,7 +494,7 @@ bool decode_tokens(const std::vector<llama_token> & tokens, int pos0, bool logit
             batch.pos[i]       = pos0 + off + i;
             batch.n_seq_id[i]  = 1;
             batch.seq_id[i][0] = 0;
-            batch.logits[i]    = false;
+            batch.logits[i]    = logits_on_all;
         }
         if (logits_on_last && off + n == total) {
             batch.logits[n - 1] = true;
@@ -753,6 +897,23 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeStop(JNIEnv *, jclass) {
 // prompt string. Exposed separately so the UI can measure the prompt before
 // committing to a turn.
 
+// Parameter count of the loaded model, used to decide whether MTP fits.
+JNIEXPORT jlong JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeModelParams(JNIEnv *, jclass) {
+    if (!g_model_loaded.load()) return 0;
+    std::lock_guard<std::mutex> guard(g_lock);
+    return g_model ? (jlong) llama_model_n_params(g_model) : 0;
+}
+
+// Whether the loaded model ships an MTP block at all, regardless of whether we
+// asked for it. Lets the UI say "unavailable" instead of silently disabling.
+JNIEXPORT jboolean JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeHasMtpBlock(JNIEnv *, jclass) {
+    if (!g_model_loaded.load()) return JNI_FALSE;
+    std::lock_guard<std::mutex> guard(g_lock);
+    return (g_model && llama_model_n_layer_nextn(g_model) > 0) ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jint JNICALL
 Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeMtpDraft(JNIEnv *, jclass) {
     if (!g_model_loaded.load()) return 0;
@@ -944,17 +1105,27 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
     int         n_generated = 0;
     int         n_past      = (int) tokens.size();
 
-    while (n_generated < (int) maxTokens) {
-        if (g_stop_requested.load()) break;
-
-        const llama_token id = llama_sampler_sample(g_sampler, g_ctx, -1);
-        if (id < 0) {
-            LOGE("sampler returned an invalid token");
-            break;
+    const bool speculative = g_ctx_mtp != nullptr && g_mtp_draft > 0;
+    if (speculative) {
+        // Mirror the prompt into the draft head so it starts from the same state.
+        if (!mtp_follow_target(tail, (int) common)) {
+            LOGW("MTP could not follow the prompt, generating without it");
         }
+    }
+
+    // Emits one token and folds it into every piece of state that tracks the
+    // conversation. Shared by both paths so they cannot drift apart.
+    int  n_drafted  = 0;
+    int  n_accepted = 0;
+    bool stop       = false;
+
+    auto emit = [&](llama_token id) {
         llama_sampler_accept(g_sampler, id);
 
-        if (llama_vocab_is_eog(vocab, id)) break;
+        if (llama_vocab_is_eog(vocab, id)) {
+            stop = true;
+            return;
+        }
 
         pending += token_to_piece(vocab, id);
         const size_t safe = utf8_safe_len(pending);
@@ -965,18 +1136,95 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
 
         g_cached_tokens.push_back(id);
         ++n_generated;
+    };
+
+    llama_token id = llama_sampler_sample(g_sampler, g_ctx, -1);
+
+    while (!stop && n_generated < (int) maxTokens) {
+        if (g_stop_requested.load()) break;
+
+        if (id < 0) {
+            LOGE("sampler returned an invalid token");
+            break;
+        }
+
+        emit(id);
+        if (stop || n_generated >= (int) maxTokens) break;
 
         if (n_past >= n_ctx - 1) {
             LOGW("context window exhausted after %d generated tokens", n_generated);
             break;
         }
 
-        const std::vector<llama_token> one{id};
-        if (!decode_tokens(one, n_past, /*logits_on_last=*/true)) {
-            LOGE("decode failed at position %d", n_past);
+        // --- plain path: one token in, one token out --------------------------
+        if (!speculative) {
+            const std::vector<llama_token> one{id};
+            if (!decode_tokens(one, n_past, /*logits_on_last=*/true)) {
+                LOGE("decode failed at position %d", n_past);
+                break;
+            }
+            ++n_past;
+            id = llama_sampler_sample(g_sampler, g_ctx, -1);
+            continue;
+        }
+
+        // --- speculative path -------------------------------------------------
+        //
+        // The draft head guesses what follows `id`; the target then checks the
+        // whole run in one pass. Whatever it agrees with is free -- those tokens
+        // cost no extra reading of the weights, which is the entire point.
+        std::vector<llama_token> draft = mtp_draft_tokens(id, n_past);
+
+        // Never run past the context window with a speculative tail.
+        while (!draft.empty() && n_past + 1 + (int) draft.size() >= n_ctx - 1) {
+            draft.pop_back();
+        }
+
+        std::vector<llama_token> run;
+        run.reserve(draft.size() + 1);
+        run.push_back(id);
+        run.insert(run.end(), draft.begin(), draft.end());
+
+        if (!decode_tokens(run, n_past, /*logits_on_last=*/false, /*logits_on_all=*/true)) {
+            LOGE("speculative decode failed at position %d", n_past);
             break;
         }
-        ++n_past;
+        mtp_follow_target(run, n_past);
+        n_drafted += (int) draft.size();
+
+        // Walk the guesses. Row j holds the distribution for the token that
+        // follows run[j], so row j is what confirms or replaces draft[j].
+        int accepted = 0;
+        llama_token next = -1;
+
+        for (size_t j = 0; j <= draft.size(); ++j) {
+            const llama_token sampled = llama_sampler_sample(g_sampler, g_ctx, (int32_t) j);
+
+            if (j < draft.size() && sampled == draft[j]) {
+                emit(sampled);
+                ++accepted;
+                if (stop || n_generated >= (int) maxTokens) break;
+                continue;
+            }
+
+            // First disagreement: the target's own token wins and everything
+            // after it was predicted from a future that will not happen.
+            next = sampled;
+            break;
+        }
+
+        n_accepted += accepted;
+        n_past += 1 + accepted;
+
+        // Drop the rejected tail so the next decode does not read state that
+        // belongs to tokens the model just discarded.
+        if (accepted < (int) draft.size()) {
+            llama_memory_seq_rm(mem, 0, (llama_pos) n_past, -1);
+        }
+        mtp_commit(accepted);
+
+        if (stop || n_generated >= (int) maxTokens) break;
+        id = next;
     }
 
     if (!pending.empty()) {
@@ -988,6 +1236,11 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
 
     LOGI("generated %d tokens in %lld ms (%.2f tok/s)", n_generated, (long long) elapsed,
          elapsed > 0 ? n_generated * 1000.0 / (double) elapsed : 0.0);
+    if (n_drafted > 0) {
+        // Acceptance is the number that decides whether MTP is worth its memory.
+        LOGI("MTP: drafted=%d accepted=%d (%.0f%%)", n_drafted, n_accepted,
+             100.0 * n_accepted / (double) n_drafted);
+    }
 
     g_stop_requested.store(false);
     g_generating.store(false);
