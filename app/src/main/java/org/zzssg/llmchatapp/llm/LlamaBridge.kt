@@ -69,8 +69,19 @@ external fun nativeSetSampling(
     seed: Int,
 )
 
-/** Applies the model's own chat template to a conversation. */
-external fun nativeFormatPrompt(roles: Array<String>, contents: Array<String>): String
+/** True when the loaded model marks its reasoning with `<think>` blocks. */
+external fun nativeSupportsThinking(): Boolean
+
+/**
+ * Applies the model's own chat template to a conversation.
+ *
+ * [thinkingMode] must match the ordinal of [ThinkingMode].
+ */
+external fun nativeFormatPrompt(
+    roles: Array<String>,
+    contents: Array<String>,
+    thinkingMode: Int,
+): String
 
 external fun nativeGenerate(prompt: String, maxTokens: Int, sink: TokenSink)
 

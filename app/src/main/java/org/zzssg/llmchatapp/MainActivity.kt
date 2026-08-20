@@ -12,19 +12,25 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Surface
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.launch
 import org.zzssg.llmchatapp.ui.ChatViewModel
+import org.zzssg.llmchatapp.ui.screens.ChatDrawer
 import org.zzssg.llmchatapp.ui.screens.ChatScreen
 import org.zzssg.llmchatapp.ui.screens.ModelSheet
 import org.zzssg.llmchatapp.ui.screens.SettingsSheet
@@ -54,7 +60,9 @@ class MainActivity : ComponentActivity() {
 private fun App(viewModel: ChatViewModel = viewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
     var showModels by rememberSaveable { mutableStateOf(false) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
 
@@ -66,6 +74,7 @@ private fun App(viewModel: ChatViewModel = viewModel()) {
     ) { uri -> uri?.let(viewModel::importModel) }
 
     val openPicker = remember(picker) { { picker.launch(arrayOf("*/*")) } }
+    val closeDrawer = remember(drawerState, scope) { { scope.launch { drawerState.close() } } }
 
     val copyToClipboard: (String) -> Unit = remember(context) {
         { text ->
@@ -79,17 +88,44 @@ private fun App(viewModel: ChatViewModel = viewModel()) {
     }
 
     if (state.isReady) {
-        ChatScreen(
-            state = state,
-            onSend = viewModel::send,
-            onStop = viewModel::stopGeneration,
-            onRetry = viewModel::retryLast,
-            onDismissError = viewModel::dismissError,
-            onNewChat = viewModel::newConversation,
-            onOpenModels = { showModels = true },
-            onOpenSettings = { showSettings = true },
-            onCopy = copyToClipboard,
-        )
+        ModalNavigationDrawer(
+            drawerState = drawerState,
+            drawerContent = {
+                ChatDrawer(
+                    chats = state.chats,
+                    activeChatId = state.activeChatId,
+                    onNewChat = {
+                        viewModel.startNewChat()
+                        closeDrawer()
+                    },
+                    onOpenChat = {
+                        viewModel.openChat(it)
+                        closeDrawer()
+                    },
+                    onDeleteChat = viewModel::deleteChat,
+                    onOpenModels = {
+                        closeDrawer()
+                        showModels = true
+                    },
+                    onOpenSettings = {
+                        closeDrawer()
+                        showSettings = true
+                    },
+                )
+            },
+        ) {
+            ChatScreen(
+                state = state,
+                onSend = viewModel::send,
+                onStop = viewModel::stopGeneration,
+                onRetry = viewModel::retryLast,
+                onDismissError = viewModel::dismissError,
+                onOpenMenu = { scope.launch { drawerState.open() } },
+                onOpenSettings = { showSettings = true },
+                onThinkingChange = viewModel::setThinkingMode,
+                onCopy = copyToClipboard,
+            )
+        }
     } else {
         WelcomeScreen(
             modelState = state.modelState,
@@ -113,6 +149,7 @@ private fun App(viewModel: ChatViewModel = viewModel()) {
     if (showSettings) {
         SettingsSheet(
             settings = state.settings,
+            canToggleThinking = state.canToggleThinking,
             onApply = viewModel::updateSettings,
             onDismiss = { showSettings = false },
         )

@@ -9,6 +9,7 @@
 #include <android/log.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdio.h>
 
 #include <algorithm>
 #include <atomic>
@@ -338,6 +339,46 @@ bool decode_tokens(const std::vector<llama_token> & tokens, int pos0, bool logit
 }
 
 
+
+constexpr const char * THINK_OPEN_TAG  = "<think>";
+constexpr const char * THINK_SUFFIX_ON  = "<think>\n";
+constexpr const char * THINK_SUFFIX_OFF = "<think>\n\n</think>\n\n";
+
+// Whether the loaded model is a reasoning model.
+//
+// Detected from its chat template rather than from the architecture name, which
+// says nothing about it: Qwen3, DeepSeek-R1 and others all mark reasoning with a
+// <think> block, and a template that never mentions one belongs to a model that
+// does not reason.
+bool model_uses_think_blocks_locked() {
+    if (!g_model) return false;
+    const char * tmpl = llama_model_chat_template(g_model, nullptr);
+    return tmpl && strstr(tmpl, THINK_OPEN_TAG) != nullptr;
+}
+
+
+// Thinking mode, mirroring org.zzssg.llmchatapp.llm.ThinkingMode.
+enum thinking_mode { THINKING_AUTO = 0, THINKING_ON = 1, THINKING_OFF = 2 };
+
+// Reproduces what the model's own Jinja template does for enable_thinking.
+//
+// llama_chat_apply_template is the non-Jinja path: it matches a template to a
+// hardcoded C++ implementation and cannot evaluate a variable like
+// enable_thinking. The templates that support it all express the choice the same
+// way -- open a <think> block for the model to fill, or pre-fill an empty one so
+// it skips straight to the answer -- so appending the suffix ourselves gives the
+// same prompt the Jinja path would have produced.
+std::string apply_thinking_suffix(const std::string & prompt, int mode) {
+    if (mode == THINKING_AUTO) return prompt;
+    if (!model_uses_think_blocks_locked()) return prompt;
+
+    // Some templates already emit the opener. Do not add a second one.
+    const size_t tail = prompt.size() < 32 ? 0 : prompt.size() - 32;
+    if (prompt.find(THINK_OPEN_TAG, tail) != std::string::npos) return prompt;
+
+    return prompt + (mode == THINKING_OFF ? THINK_SUFFIX_OFF : THINK_SUFFIX_ON);
+}
+
 // Reads general.architecture straight out of the GGUF header.
 //
 // llama.cpp rejects an unknown architecture with a runtime_error that it logs
@@ -357,6 +398,53 @@ std::string read_gguf_architecture(const char * path) {
     }
     gguf_free(ctx);
     return arch;
+}
+
+
+// Number of cores in the fastest frequency tier.
+//
+// Inference threads run in lockstep and synchronise at every layer, so a thread
+// on a slow core stalls all the others. What matters is therefore how many
+// *equally fast* cores exist, not how many cores there are.
+//
+// Guessing that from the core count alone breaks on both ends: a 4+4 big.LITTLE
+// phone and an all-performance flagship both report 8, but want 4 and 8 threads
+// respectively. Linux exposes the real answer through cpufreq.
+int count_fastest_cores() {
+    const long online = sysconf(_SC_NPROCESSORS_ONLN);
+    const int  cpus   = (int) (online > 0 ? online : 1);
+
+    std::vector<long> max_freq;
+    max_freq.reserve((size_t) cpus);
+
+    for (int i = 0; i < cpus; ++i) {
+        char path[128];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+        FILE * f = fopen(path, "r");
+        if (!f) continue;
+        long khz = 0;
+        if (fscanf(f, "%ld", &khz) == 1 && khz > 0) max_freq.push_back(khz);
+        fclose(f);
+    }
+
+    if (max_freq.empty()) {
+        // No cpufreq (some emulators, restricted sandboxes). Fall back to the
+        // conservative big.LITTLE assumption.
+        return std::max(1, cpus > 4 ? cpus / 2 : cpus);
+    }
+
+    const long fastest = *std::max_element(max_freq.begin(), max_freq.end());
+    // Within 15% counts as the same tier: prime and performance cores in one
+    // cluster differ slightly in clock but are equally useful here.
+    const long threshold = fastest - fastest / 7;
+
+    int n = 0;
+    for (long khz : max_freq) {
+        if (khz >= threshold) ++n;
+    }
+
+    return std::clamp(n, 1, cpus);
 }
 
 void ggml_log_to_logcat(ggml_log_level level, const char * text, void *) {
@@ -406,12 +494,8 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
 
     int n_threads = threads;
     if (n_threads <= 0) {
-        // Big cores only. Using every core including the LITTLE cluster is
-        // consistently slower, because the fast threads wait on the slow ones
-        // at every barrier.
-        const long online = sysconf(_SC_NPROCESSORS_ONLN);
-        const int  cpus   = (int) (online > 0 ? online : 1);
-        n_threads = std::max(1, cpus > 4 ? cpus / 2 : cpus);
+        n_threads = count_fastest_cores();
+        LOGI("auto thread count: %d", n_threads);
     }
 
     llama_model_params mparams = llama_model_default_params();
@@ -573,9 +657,17 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeStop(JNIEnv *, jclass) {
 // Formats `roles`/`contents` with the model's own chat template and returns the
 // prompt string. Exposed separately so the UI can measure the prompt before
 // committing to a turn.
+
+JNIEXPORT jboolean JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeSupportsThinking(JNIEnv *, jclass) {
+    if (!g_model_loaded.load()) return JNI_FALSE;
+    std::lock_guard<std::mutex> guard(g_lock);
+    return model_uses_think_blocks_locked() ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jstring JNICALL
 Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeFormatPrompt(
-        JNIEnv * env, jclass, jobjectArray jroles, jobjectArray jcontents) {
+        JNIEnv * env, jclass, jobjectArray jroles, jobjectArray jcontents, jint thinkingMode) {
 
     if (!g_model_loaded.load()) return utf8_to_jstring(env, "", 0);
 
@@ -628,11 +720,11 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeFormatPrompt(
             fallback += "\n";
         }
         fallback += "Assistant:";
-        return utf8_to_jstring(env, fallback);
+        return utf8_to_jstring(env, apply_thinking_suffix(fallback, thinkingMode));
     }
 
     buf.resize((size_t) len);
-    return utf8_to_jstring(env, buf);
+    return utf8_to_jstring(env, apply_thinking_suffix(buf, thinkingMode));
 }
 
 JNIEXPORT void JNICALL

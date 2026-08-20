@@ -17,49 +17,75 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
-// A calm slate-and-teal palette. The old theme hardcoded the Material 2 purple
-// on light and a mismatched purple/teal pair on dark, so the two themes did not
-// look like the same product.
+// A warm honey-and-rose palette on ivory neutrals.
+//
+// Chosen against the grain of the category: on-device AI tooling defaults to cool
+// slate-and-teal, which reads as infrastructure. This app is something you talk
+// to, so the neutrals carry a warm bias rather than being pure grey, and the
+// accent is a honey amber with a rose secondary for the quieter surfaces.
+//
+// Both themes are defined together and share the same role structure, so a
+// component styled through the tokens is correct in either.
 private val LightColors = lightColorScheme(
-    primary = Color(0xFF126B63),
+    primary = Color(0xFF8F5A00),
     onPrimary = Color(0xFFFFFFFF),
-    primaryContainer = Color(0xFFA6F2E7),
-    onPrimaryContainer = Color(0xFF00201D),
-    secondary = Color(0xFF4A635F),
+    primaryContainer = Color(0xFFFFDDB0),
+    onPrimaryContainer = Color(0xFF2D1600),
+
+    secondary = Color(0xFF8C4A5F),
     onSecondary = Color(0xFFFFFFFF),
-    secondaryContainer = Color(0xFFCCE8E3),
-    onSecondaryContainer = Color(0xFF06201C),
-    background = Color(0xFFFAFDFB),
-    onBackground = Color(0xFF191C1B),
-    surface = Color(0xFFFAFDFB),
-    onSurface = Color(0xFF191C1B),
-    surfaceVariant = Color(0xFFDAE5E1),
-    onSurfaceVariant = Color(0xFF3F4947),
-    outline = Color(0xFF6F7977),
-    outlineVariant = Color(0xFFBEC9C6),
-    error = Color(0xFFBA1A1A),
+    secondaryContainer = Color(0xFFFFD9E2),
+    onSecondaryContainer = Color(0xFF3A0A1C),
+
+    tertiary = Color(0xFF4F6354),
+    onTertiary = Color(0xFFFFFFFF),
+    tertiaryContainer = Color(0xFFD1E8D5),
+    onTertiaryContainer = Color(0xFF0C1F13),
+
+    background = Color(0xFFFFF8F3),
+    onBackground = Color(0xFF211A14),
+    surface = Color(0xFFFFF8F3),
+    onSurface = Color(0xFF211A14),
+    surfaceVariant = Color(0xFFF2E0D0),
+    onSurfaceVariant = Color(0xFF51443A),
+    surfaceContainerHighest = Color(0xFFF6E7DA),
+
+    outline = Color(0xFF84766A),
+    outlineVariant = Color(0xFFD6C3B4),
+
+    error = Color(0xFFA4302A),
     onError = Color(0xFFFFFFFF),
-    errorContainer = Color(0xFFFFDAD6),
-    onErrorContainer = Color(0xFF410002),
+    errorContainer = Color(0xFFFFDAD5),
+    onErrorContainer = Color(0xFF410100),
 )
 
 private val DarkColors = darkColorScheme(
-    primary = Color(0xFF8AD5CB),
-    onPrimary = Color(0xFF003733),
-    primaryContainer = Color(0xFF00504A),
-    onPrimaryContainer = Color(0xFFA6F2E7),
-    secondary = Color(0xFFB1CCC7),
-    onSecondary = Color(0xFF1C3532),
-    secondaryContainer = Color(0xFF334B48),
-    onSecondaryContainer = Color(0xFFCCE8E3),
-    background = Color(0xFF101413),
-    onBackground = Color(0xFFE0E3E1),
-    surface = Color(0xFF101413),
-    onSurface = Color(0xFFE0E3E1),
-    surfaceVariant = Color(0xFF3F4947),
-    onSurfaceVariant = Color(0xFFBEC9C6),
-    outline = Color(0xFF899391),
-    outlineVariant = Color(0xFF3F4947),
+    primary = Color(0xFFFFB95C),
+    onPrimary = Color(0xFF4A2800),
+    primaryContainer = Color(0xFF6B3D00),
+    onPrimaryContainer = Color(0xFFFFDDB0),
+
+    secondary = Color(0xFFFFB1C5),
+    onSecondary = Color(0xFF54233A),
+    secondaryContainer = Color(0xFF6F3950),
+    onSecondaryContainer = Color(0xFFFFD9E2),
+
+    tertiary = Color(0xFFB5CCBA),
+    onTertiary = Color(0xFF213528),
+    tertiaryContainer = Color(0xFF374B3D),
+    onTertiaryContainer = Color(0xFFD1E8D5),
+
+    background = Color(0xFF19120C),
+    onBackground = Color(0xFFEDE0D6),
+    surface = Color(0xFF19120C),
+    onSurface = Color(0xFFEDE0D6),
+    surfaceVariant = Color(0xFF51443A),
+    onSurfaceVariant = Color(0xFFD6C3B4),
+    surfaceContainerHighest = Color(0xFF2A211A),
+
+    outline = Color(0xFF9E8E81),
+    outlineVariant = Color(0xFF51443A),
+
     error = Color(0xFFFFB4AB),
     onError = Color(0xFF690005),
     errorContainer = Color(0xFF93000A),
@@ -68,10 +94,12 @@ private val DarkColors = darkColorScheme(
 
 private val AppTypography = Typography().let { base ->
     base.copy(
-        // Chat is a reading surface, so the body style gets a slightly taller
-        // line height than the Material default.
+        // Chat is a reading surface, so body styles get a taller line height than
+        // the Material default.
         bodyLarge = base.bodyLarge.copy(fontSize = 16.sp, lineHeight = 24.sp),
         bodyMedium = base.bodyMedium.copy(fontSize = 15.sp, lineHeight = 22.sp),
+        titleMedium = base.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+        labelLarge = base.labelLarge.copy(fontWeight = FontWeight.Medium),
     )
 }
 
@@ -83,6 +111,12 @@ val CodeTextStyle: TextStyle = TextStyle(
     fontWeight = FontWeight.Normal,
 )
 
+/**
+ * A 4dp-based spacing scale.
+ *
+ * Section spacing uses the larger steps so hierarchy comes from rhythm rather
+ * than from arbitrary per-component padding.
+ */
 object Spacing {
     val xs = 4.dp
     val sm = 8.dp
@@ -91,6 +125,9 @@ object Spacing {
     val xl = 24.dp
     val xxl = 32.dp
 }
+
+/** Minimum comfortable touch target on Android. */
+val MinTouchTarget = 48.dp
 
 @Composable
 fun LlmChatTheme(

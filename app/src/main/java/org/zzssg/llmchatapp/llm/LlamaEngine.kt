@@ -21,6 +21,24 @@ data class ChatTurn(val role: String, val content: String) {
     }
 }
 
+/**
+ * Whether the model should reason before answering.
+ *
+ * Reasoning models emit a `<think>` block; the choice is expressed in the prompt
+ * itself, so it costs nothing to change and takes effect on the very next turn.
+ * The ordinals are shared with the native side.
+ */
+enum class ThinkingMode {
+    /** Leave the template alone and let the model decide. */
+    AUTO,
+
+    /** Reason first. Better on hard questions, slower and more tokens. */
+    ON,
+
+    /** Answer directly. Noticeably faster on a phone. */
+    OFF,
+}
+
 /** Knobs exposed in the settings sheet. */
 data class SamplingConfig(
     val temperature: Float = 0.7f,
@@ -31,6 +49,7 @@ data class SamplingConfig(
     /** Negative means "reseed on every turn". */
     val seed: Int = -1,
     val maxTokens: Int = 512,
+    val thinking: ThinkingMode = ThinkingMode.AUTO,
 )
 
 /** What the engine knows about the model that is currently resident. */
@@ -38,6 +57,8 @@ data class LoadedModel(
     val file: File,
     val description: String,
     val contextSize: Int,
+    /** Whether a thinking toggle is meaningful for this model. */
+    val supportsThinking: Boolean,
 )
 
 /** A failure with a stable code, so the UI can react without matching on prose. */
@@ -86,6 +107,7 @@ class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
             file = file,
             description = nativeModelDescription(),
             contextSize = nativeContextSize(),
+            supportsThinking = nativeSupportsThinking(),
         )
     }
 
@@ -132,6 +154,7 @@ class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
             val prompt = nativeFormatPrompt(
                 turns.map { it.role }.toTypedArray(),
                 turns.map { it.content }.toTypedArray(),
+                config.thinking.ordinal,
             )
             if (prompt.isEmpty()) {
                 throw LlamaException("E_PROMPT", "Could not build a prompt for this model.")

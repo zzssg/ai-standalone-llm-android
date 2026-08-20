@@ -3,6 +3,7 @@ package org.zzssg.llmchatapp.data
 import android.content.Context
 import androidx.core.content.edit
 import org.zzssg.llmchatapp.llm.SamplingConfig
+import org.zzssg.llmchatapp.llm.ThinkingMode
 
 /** Everything the user can tune, plus which model to reopen on next launch. */
 data class AppSettings(
@@ -38,6 +39,11 @@ class SettingsStore(context: Context) {
                 minP = prefs.getFloat(KEY_MIN_P, defaults.sampling.minP),
                 repeatPenalty = prefs.getFloat(KEY_REPEAT_PENALTY, defaults.sampling.repeatPenalty),
                 maxTokens = prefs.getInt(KEY_MAX_TOKENS, defaults.sampling.maxTokens),
+                thinking = runCatching {
+                    ThinkingMode.valueOf(
+                        prefs.getString(KEY_THINKING, null) ?: defaults.sampling.thinking.name
+                    )
+                }.getOrDefault(defaults.sampling.thinking),
             ),
             contextSize = prefs.getInt(KEY_CONTEXT_SIZE, defaults.contextSize),
             threads = prefs.getInt(KEY_THREADS, defaults.threads),
@@ -53,6 +59,7 @@ class SettingsStore(context: Context) {
         putFloat(KEY_MIN_P, settings.sampling.minP)
         putFloat(KEY_REPEAT_PENALTY, settings.sampling.repeatPenalty)
         putInt(KEY_MAX_TOKENS, settings.sampling.maxTokens)
+        putString(KEY_THINKING, settings.sampling.thinking.name)
         putInt(KEY_CONTEXT_SIZE, settings.contextSize)
         putInt(KEY_THREADS, settings.threads)
         putString(KEY_LAST_MODEL, settings.lastModelId)
@@ -66,6 +73,7 @@ class SettingsStore(context: Context) {
         const val KEY_MIN_P = "min_p"
         const val KEY_REPEAT_PENALTY = "repeat_penalty"
         const val KEY_MAX_TOKENS = "max_tokens"
+        const val KEY_THINKING = "thinking_mode"
         const val KEY_CONTEXT_SIZE = "context_size"
         const val KEY_THREADS = "threads"
         const val KEY_LAST_MODEL = "last_model"

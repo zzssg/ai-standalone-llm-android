@@ -5,4 +5,7 @@ plugins {
     // itself, so the old composeOptions.kotlinCompilerExtensionVersion pin is
     // gone and version skew between the two is no longer possible.
     id 'org.jetbrains.kotlin.plugin.compose' version '2.2.20' apply false
+    // Chat history is persisted as JSON. kotlinx.serialization rather than
+    // org.json so the store stays unit-testable on the JVM.
+    id 'org.jetbrains.kotlin.plugin.serialization' version '2.2.20' apply false
 }

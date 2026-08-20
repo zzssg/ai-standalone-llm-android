@@ -3,10 +3,15 @@ package org.zzssg.llmchatapp.ui.screens
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.DragInteraction
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -26,15 +31,19 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Chat
 import androidx.compose.material.icons.automirrored.outlined.Send
-import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.ArrowDownward
+import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.Layers
+import androidx.compose.material.icons.outlined.Menu
+import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.outlined.Stop
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -58,11 +67,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import org.zzssg.llmchatapp.llm.ThinkingMode
 import org.zzssg.llmchatapp.ui.ChatUiState
+import org.zzssg.llmchatapp.ui.LoadReason
+import org.zzssg.llmchatapp.ui.ModelUiState
 import org.zzssg.llmchatapp.ui.UserFacingError
 import org.zzssg.llmchatapp.ui.components.MessageBubble
+import org.zzssg.llmchatapp.ui.theme.MinTouchTarget
 import org.zzssg.llmchatapp.ui.theme.Spacing
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -73,31 +87,53 @@ fun ChatScreen(
     onStop: () -> Unit,
     onRetry: () -> Unit,
     onDismissError: () -> Unit,
-    onNewChat: () -> Unit,
-    onOpenModels: () -> Unit,
+    onOpenMenu: () -> Unit,
     onOpenSettings: () -> Unit,
+    onThinkingChange: (ThinkingMode) -> Unit,
     onCopy: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
 
-    // Survives rotation, unlike the plain `remember` the old screen used for both
-    // the draft and the whole transcript.
+    // Survives rotation, unlike the plain `remember` the old screen used.
     var draft by rememberSaveable { mutableStateOf("") }
 
-    val isAtBottom by remember {
-        derivedStateOf {
-            val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()
-            last == null || last.index >= listState.layoutInfo.totalItemsCount - 1
+    val isAtBottom by remember { derivedStateOf { listState.isScrolledToBottom() } }
+
+    // Whether new tokens should pull the view along.
+    //
+    // Position alone is not enough to decide this: while a reply streams in, the
+    // message can be several screens tall, and a reader scrolling back through it
+    // is still "inside" the last item. Touching the list hands control to the
+    // user; returning to the bottom hands it back.
+    var followStream by remember { mutableStateOf(true) }
+
+    LaunchedEffect(listState) {
+        listState.interactionSource.interactions.collect { interaction ->
+            // Only user-driven drags count. Programmatic scrolls do not emit
+            // these, so following does not switch itself off.
+            if (interaction is DragInteraction.Start || interaction is PressInteraction.Press) {
+                followStream = false
+            }
         }
     }
 
-    // Follow the stream only while the user is already at the bottom; yanking the
-    // list down while they scroll back through history is worse than not following.
-    LaunchedEffect(state.messages.lastOrNull()?.text, state.messages.size) {
-        if (isAtBottom && state.messages.isNotEmpty()) {
-            listState.animateScrollToItem(state.messages.lastIndex)
+    LaunchedEffect(isAtBottom) {
+        if (isAtBottom) followStream = true
+    }
+
+    // A message the user just sent always pulls the view down, whatever they were
+    // reading a moment ago.
+    LaunchedEffect(state.messages.size) {
+        followStream = true
+    }
+
+    LaunchedEffect(state.messages.lastOrNull()?.text, state.messages.size, followStream) {
+        if (followStream && state.messages.isNotEmpty()) {
+            // Instant rather than animated: a new frame arrives every token, and
+            // animations would queue up and fight each other.
+            listState.scrollToItemEnd(state.messages.lastIndex)
         }
     }
 
@@ -111,6 +147,7 @@ fun ChatScreen(
                             text = state.activeModel?.file?.nameWithoutExtension ?: "No model",
                             style = MaterialTheme.typography.titleMedium,
                             maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                         state.activeModel?.let {
                             Text(
@@ -122,14 +159,11 @@ fun ChatScreen(
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = onNewChat) {
-                        Icon(Icons.Outlined.Add, contentDescription = "New conversation")
+                    IconButton(onClick = onOpenMenu) {
+                        Icon(Icons.Outlined.Menu, contentDescription = "Chats and settings")
                     }
                 },
                 actions = {
-                    IconButton(onClick = onOpenModels) {
-                        Icon(Icons.Outlined.Layers, contentDescription = "Models")
-                    }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Outlined.Tune, contentDescription = "Settings")
                     }
@@ -140,8 +174,8 @@ fun ChatScreen(
             Composer(
                 draft = draft,
                 onDraftChange = { draft = it },
-                isGenerating = state.isGenerating,
-                enabled = state.isReady,
+                state = state,
+                onThinkingChange = onThinkingChange,
                 onSend = {
                     val text = draft
                     draft = ""
@@ -188,12 +222,81 @@ fun ChatScreen(
             ) {
                 FloatingActionButton(
                     onClick = {
-                        scope.launch { listState.animateScrollToItem(state.messages.lastIndex) }
+                        scope.launch {
+                            listState.scrollToItemEnd(state.messages.lastIndex)
+                            followStream = true
+                        }
                     },
-                    modifier = Modifier.size(40.dp),
+                    modifier = Modifier.size(44.dp),
                 ) {
                     Icon(Icons.Outlined.ArrowDownward, contentDescription = "Scroll to latest")
                 }
+            }
+        }
+    }
+
+    // Reopening the model takes seconds and makes the whole screen inoperable, so
+    // it gets a scrim rather than a silent freeze. The previous build showed
+    // nothing here and the app simply stopped responding to Send.
+    AnimatedVisibility(
+        visible = state.isReloading,
+        enter = fadeIn(),
+        exit = fadeOut(),
+    ) {
+        (state.modelState as? ModelUiState.Loading)?.let { ReloadOverlay(it) }
+    }
+}
+
+@Composable
+private fun ReloadOverlay(loading: ModelUiState.Loading) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.5f))
+            // Swallow taps so nothing underneath reacts while the engine is down.
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = {},
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+            tonalElevation = 6.dp,
+            modifier = Modifier.padding(Spacing.xl),
+        ) {
+            Column(
+                modifier = Modifier.padding(Spacing.xl),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                CircularProgressIndicator(Modifier.size(36.dp), strokeWidth = 3.dp)
+                Spacer(Modifier.height(Spacing.lg))
+                Text(
+                    text = when (loading.reason) {
+                        LoadReason.SETTINGS_CHANGED -> "Applying settings"
+                        LoadReason.OPENING -> "Opening model"
+                    },
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Spacer(Modifier.height(Spacing.xs))
+                Text(
+                    text = when (loading.reason) {
+                        // Say why the wait is happening. A reload the user did not
+                        // ask for otherwise reads as the app hanging.
+                        LoadReason.SETTINGS_CHANGED ->
+                            "Context size and thread count are fixed when the model " +
+                                "opens, so ${loading.name} is being reloaded. Your chat is kept."
+
+                        LoadReason.OPENING ->
+                            "Reading ${loading.name} into memory. The first load is the slow one."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.widthIn(max = 260.dp),
+                )
             }
         }
     }
@@ -203,59 +306,116 @@ fun ChatScreen(
 private fun Composer(
     draft: String,
     onDraftChange: (String) -> Unit,
-    isGenerating: Boolean,
-    enabled: Boolean,
+    state: ChatUiState,
+    onThinkingChange: (ThinkingMode) -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
 ) {
     Surface(tonalElevation = 3.dp) {
-        Row(
-            modifier = Modifier
+        Column(
+            Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
                 .imePadding()
                 .padding(horizontal = Spacing.md, vertical = Spacing.sm),
-            verticalAlignment = Alignment.Bottom,
-            horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
         ) {
-            OutlinedTextField(
-                value = draft,
-                onValueChange = onDraftChange,
-                modifier = Modifier
-                    .weight(1f)
-                    // Grows with the message instead of the old single-line field,
-                    // but stops before it swallows the transcript.
-                    .heightIn(min = 48.dp, max = 140.dp),
-                placeholder = { Text("Message") },
-                shape = RoundedCornerShape(24.dp),
-                maxLines = 5,
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
-                // Stays editable while the model writes so the next message can be
-                // composed in advance; only sending is blocked.
-                enabled = enabled,
-            )
+            // Only shown for models that actually reason, so it never appears as a
+            // control that does nothing.
+            if (state.canToggleThinking) {
+                ThinkingChip(
+                    mode = state.settings.sampling.thinking,
+                    enabled = !state.isGenerating,
+                    onChange = onThinkingChange,
+                )
+                Spacer(Modifier.height(Spacing.sm))
+            }
 
-            if (isGenerating) {
-                FilledIconButton(
-                    onClick = onStop,
-                    modifier = Modifier.size(48.dp),
-                    colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer,
-                        contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                    ),
-                ) {
-                    Icon(Icons.Outlined.Stop, contentDescription = "Stop generating")
-                }
-            } else {
-                FilledIconButton(
-                    onClick = onSend,
-                    enabled = enabled && draft.isNotBlank(),
-                    modifier = Modifier.size(48.dp),
-                ) {
-                    Icon(Icons.AutoMirrored.Outlined.Send, contentDescription = "Send")
+            Row(
+                verticalAlignment = Alignment.Bottom,
+                horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+            ) {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = onDraftChange,
+                    modifier = Modifier
+                        .weight(1f)
+                        // Grows with the message but stops before it swallows the
+                        // transcript.
+                        .heightIn(min = MinTouchTarget, max = 140.dp),
+                    placeholder = { Text("Message") },
+                    shape = RoundedCornerShape(24.dp),
+                    maxLines = 5,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
+                    enabled = state.isReady && !state.isReloading,
+                )
+
+                if (state.isGenerating) {
+                    FilledIconButton(
+                        onClick = onStop,
+                        modifier = Modifier.size(MinTouchTarget),
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer,
+                            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                        ),
+                    ) {
+                        Icon(Icons.Outlined.Stop, contentDescription = "Stop generating")
+                    }
+                } else {
+                    FilledIconButton(
+                        onClick = onSend,
+                        enabled = state.isReady && !state.isReloading && draft.isNotBlank(),
+                        modifier = Modifier.size(MinTouchTarget),
+                    ) {
+                        Icon(Icons.AutoMirrored.Outlined.Send, contentDescription = "Send")
+                    }
                 }
             }
         }
+    }
+}
+
+/**
+ * Thinking mode, one tap from the composer.
+ *
+ * It lives here rather than only in settings because it is a per-question choice:
+ * reasoning is worth the wait on a hard problem and pure overhead on "what time
+ * is it in Tokyo". The cost is stated next to it, since on a phone the difference
+ * is tens of seconds.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ThinkingChip(
+    mode: ThinkingMode,
+    enabled: Boolean,
+    onChange: (ThinkingMode) -> Unit,
+) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        val thinkingOn = mode != ThinkingMode.OFF
+
+        FilterChip(
+            selected = thinkingOn,
+            onClick = { onChange(if (thinkingOn) ThinkingMode.OFF else ThinkingMode.ON) },
+            enabled = enabled,
+            label = { Text(if (thinkingOn) "Thinking on" else "Thinking off") },
+            leadingIcon = {
+                Icon(
+                    imageVector = if (thinkingOn) Icons.Outlined.Psychology else Icons.Outlined.Bolt,
+                    contentDescription = null,
+                    modifier = Modifier.size(FilterChipDefaults.IconSize),
+                )
+            },
+        )
+
+        Text(
+            text = if (thinkingOn) "Reasons first, slower" else "Answers directly, faster",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
@@ -273,10 +433,7 @@ private fun EmptyTranscript(modifier: Modifier = Modifier) {
             tint = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(Modifier.height(Spacing.md))
-        Text(
-            text = "Ask anything",
-            style = MaterialTheme.typography.titleMedium,
-        )
+        Text("Ask anything", style = MaterialTheme.typography.titleMedium)
         Spacer(Modifier.height(Spacing.xs))
         Text(
             text = "Replies are generated on this device, so the first tokens take " +
@@ -291,7 +448,7 @@ private fun EmptyTranscript(modifier: Modifier = Modifier) {
 
 /**
  * Errors are shown inline and stay until dismissed. Toasts, which the old build
- * used, vanish after a few seconds and cannot carry a retry action.
+ * used, vanish after seconds and cannot carry a retry action.
  */
 @Composable
 private fun ErrorBanner(
@@ -302,19 +459,26 @@ private fun ErrorBanner(
 ) {
     Surface(
         modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
+        shape = RoundedCornerShape(16.dp),
         color = MaterialTheme.colorScheme.errorContainer,
         contentColor = MaterialTheme.colorScheme.onErrorContainer,
         tonalElevation = 6.dp,
     ) {
-        Column(Modifier.padding(start = Spacing.lg, top = Spacing.md, end = Spacing.sm, bottom = Spacing.sm)) {
+        Column(
+            Modifier.padding(
+                start = Spacing.lg,
+                top = Spacing.md,
+                end = Spacing.sm,
+                bottom = Spacing.sm,
+            )
+        ) {
             Row(verticalAlignment = Alignment.Top) {
                 Column(Modifier.weight(1f)) {
                     Text(error.title, style = MaterialTheme.typography.titleSmall)
                     Spacer(Modifier.height(Spacing.xs))
                     Text(error.detail, style = MaterialTheme.typography.bodySmall)
                 }
-                IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
+                IconButton(onClick = onDismiss, modifier = Modifier.size(40.dp)) {
                     Icon(
                         Icons.Outlined.Close,
                         contentDescription = "Dismiss",

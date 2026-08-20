@@ -12,6 +12,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.zzssg.llmchatapp.data.AppSettings
+import org.zzssg.llmchatapp.data.ChatStore
+import org.zzssg.llmchatapp.data.ChatSummary
+import org.zzssg.llmchatapp.data.StoredChat
+import org.zzssg.llmchatapp.data.StoredMessage
 import org.zzssg.llmchatapp.data.ImportProgress
 import org.zzssg.llmchatapp.data.ModelFile
 import org.zzssg.llmchatapp.data.ModelStore
@@ -21,6 +25,7 @@ import org.zzssg.llmchatapp.llm.GenerationEvent
 import org.zzssg.llmchatapp.llm.LlamaEngine
 import org.zzssg.llmchatapp.llm.LlamaException
 import org.zzssg.llmchatapp.llm.LoadedModel
+import org.zzssg.llmchatapp.llm.ThinkingMode
 import org.zzssg.llmchatapp.ui.components.THINK_CLOSE
 import org.zzssg.llmchatapp.ui.components.THINK_OPEN
 import java.util.Locale
@@ -65,8 +70,15 @@ data class GenerationStats(val tokenCount: Int, val elapsedMs: Long) {
 sealed interface ModelUiState {
     data object Idle : ModelUiState
     data class Importing(val fraction: Float?, val copied: Long, val total: Long) : ModelUiState
-    data class Loading(val name: String) : ModelUiState
+
+    /**
+     * The model is being opened. [reason] explains why, because a reload the user
+     * did not ask for -- triggered by a settings change -- needs to say so.
+     */
+    data class Loading(val name: String, val reason: LoadReason = LoadReason.OPENING) : ModelUiState
 }
+
+enum class LoadReason { OPENING, SETTINGS_CHANGED }
 
 data class ChatUiState(
     val messages: List<ChatMessage> = emptyList(),
@@ -77,9 +89,15 @@ data class ChatUiState(
     val settings: AppSettings = AppSettings(),
     val error: UserFacingError? = null,
     val nativeAvailable: Boolean = true,
+    val chats: List<ChatSummary> = emptyList(),
+    val activeChatId: String? = null,
 ) {
     val isReady: Boolean get() = activeModel != null
     val isBusy: Boolean get() = modelState != ModelUiState.Idle
+    val isReloading: Boolean get() = modelState is ModelUiState.Loading
+
+    /** A thinking toggle only makes sense for a model that reasons. */
+    val canToggleThinking: Boolean get() = activeModel?.supportsThinking == true
 }
 
 /** An error phrased for a person, with an optional recovery action. */
@@ -94,6 +112,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val engine = LlamaEngine()
     private val modelStore = ModelStore(app)
     private val settingsStore = SettingsStore(app)
+    private val chatStore = ChatStore(app)
 
     private val _state = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
@@ -104,6 +123,85 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val settings = settingsStore.load()
         _state.update { it.copy(settings = settings, nativeAvailable = engine.isAvailable) }
         refreshModels(autoLoadId = settings.lastModelId)
+        refreshChats()
+    }
+
+    // -- Conversation history -----------------------------------------------
+
+    fun refreshChats() {
+        viewModelScope.launch {
+            _state.update { it.copy(chats = chatStore.list()) }
+        }
+    }
+
+    /** Opens a stored conversation, replacing whatever is on screen. */
+    fun openChat(id: String) {
+        if (_state.value.activeChatId == id) return
+        viewModelScope.launch {
+            stopGeneration()
+            val stored = chatStore.load(id) ?: return@launch
+            // The KV cache holds the previous conversation; the new one has to be
+            // processed from scratch.
+            engine.resetSession()
+            _state.update { state ->
+                state.copy(
+                    activeChatId = stored.id,
+                    messages = stored.messages.map { it.toUiMessage() },
+                    error = null,
+                )
+            }
+        }
+    }
+
+    fun deleteChat(id: String) {
+        viewModelScope.launch {
+            chatStore.delete(id)
+            if (_state.value.activeChatId == id) {
+                startNewChat()
+            }
+            _state.update { it.copy(chats = chatStore.list()) }
+        }
+    }
+
+    /** Clears the screen for a fresh conversation. Nothing is written until it has content. */
+    fun startNewChat() {
+        viewModelScope.launch {
+            stopGeneration()
+            engine.resetSession()
+            _state.update { it.copy(activeChatId = null, messages = emptyList(), error = null) }
+        }
+    }
+
+    /**
+     * Writes the current conversation to disk.
+     *
+     * Called once a turn completes rather than on every token: a chat is only
+     * worth keeping when it has an answer in it, and rewriting the file per token
+     * would be pointless I/O.
+     */
+    private fun persistCurrentChat() {
+        val state = _state.value
+        val messages = state.messages.filter { it.text.isNotBlank() }
+        if (messages.isEmpty()) return
+
+        viewModelScope.launch {
+            val now = System.currentTimeMillis()
+            val id = state.activeChatId ?: UUID.randomUUID().toString()
+            val existing = state.activeChatId?.let { chatStore.load(it) }
+
+            chatStore.save(
+                StoredChat(
+                    id = id,
+                    title = existing?.title?.takeIf { it.isNotBlank() }
+                        ?: ChatStore.deriveTitle(messages.firstOrNull { it.isUser }?.text.orEmpty()),
+                    createdAt = existing?.createdAt ?: now,
+                    updatedAt = now,
+                    modelId = state.activeModel?.file?.nameWithoutExtension.orEmpty(),
+                    messages = messages.map { it.toStored() },
+                )
+            )
+            _state.update { it.copy(activeChatId = id, chats = chatStore.list()) }
+        }
     }
 
     // -- Model library ------------------------------------------------------
@@ -155,12 +253,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Loads [model] into the engine and makes it the active one. */
-    fun activate(model: ModelFile) {
+    fun activate(model: ModelFile, reason: LoadReason = LoadReason.OPENING) {
         if (_state.value.isBusy) return
         viewModelScope.launch {
             stopGeneration()
             _state.update {
-                it.copy(modelState = ModelUiState.Loading(model.displayName), error = null)
+                it.copy(
+                    modelState = ModelUiState.Loading(model.displayName, reason),
+                    error = null,
+                )
             }
             try {
                 val settings = _state.value.settings
@@ -179,9 +280,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         activeModel = loaded,
                         modelState = ModelUiState.Idle,
                         settings = updatedSettings,
-                        // A different model means a different tokenizer and
-                        // template, so the old transcript is not replayable.
-                        messages = emptyList(),
+                        // Reopening the same model for a settings change keeps the
+                        // conversation; switching models does not, because a
+                        // different tokenizer and template make it unreplayable.
+                        messages = if (reason == LoadReason.SETTINGS_CHANGED) it.messages else emptyList(),
+                        activeChatId = if (reason == LoadReason.SETTINGS_CHANGED) it.activeChatId else null,
                     )
                 }
             } catch (e: Exception) {
@@ -280,6 +383,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } finally {
                 _state.update { it.copy(isGenerating = false) }
+                persistCurrentChat()
             }
         }
     }
@@ -307,13 +411,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         send(lastUser.text)
     }
 
-    fun newConversation() {
-        viewModelScope.launch {
-            stopGeneration()
-            engine.resetSession()
-            _state.update { it.copy(messages = emptyList(), error = null) }
-        }
-    }
+    fun newConversation() = startNewChat()
 
     // -- Settings -----------------------------------------------------------
 
@@ -332,9 +430,21 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             if (needsReload) {
                 _state.value.models
                     .firstOrNull { it.id == _state.value.activeModel?.file?.name }
-                    ?.let { activate(it) }
+                    ?.let { activate(it, LoadReason.SETTINGS_CHANGED) }
             }
         }
+    }
+
+    /**
+     * Thinking mode is a per-question choice, so it applies immediately and is
+     * persisted -- no reload, because it only changes the prompt suffix.
+     */
+    fun setThinkingMode(mode: ThinkingMode) {
+        val updated = _state.value.settings.let {
+            it.copy(sampling = it.sampling.copy(thinking = mode))
+        }
+        settingsStore.save(updated)
+        _state.update { it.copy(settings = updated) }
     }
 
     fun dismissError() = _state.update { it.copy(error = null) }
@@ -398,6 +508,19 @@ private fun String.withoutReasoning(): String {
     }
     return out.toString().trim()
 }
+
+private fun StoredMessage.toUiMessage() = ChatMessage(
+    role = role,
+    text = text,
+    stats = if (tokenCount > 0) GenerationStats(tokenCount, elapsedMs) else null,
+)
+
+private fun ChatMessage.toStored() = StoredMessage(
+    role = role,
+    text = text,
+    tokenCount = stats?.tokenCount ?: 0,
+    elapsedMs = stats?.elapsedMs ?: 0,
+)
 
 private fun Throwable.readableMessage(): String = when (this) {
     is LlamaException -> message ?: "Unknown engine error ($code)."
