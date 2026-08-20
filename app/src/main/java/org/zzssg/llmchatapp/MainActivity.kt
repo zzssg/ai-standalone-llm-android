@@ -150,6 +150,7 @@ private fun App(viewModel: ChatViewModel = viewModel()) {
         SettingsSheet(
             settings = state.settings,
             canToggleThinking = state.canToggleThinking,
+            mtpDecision = state.mtpDecision,
             onApply = viewModel::updateSettings,
             onDismiss = { showSettings = false },
         )

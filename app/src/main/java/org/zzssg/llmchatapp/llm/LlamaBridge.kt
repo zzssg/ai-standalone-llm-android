@@ -32,8 +32,13 @@ interface TokenSink {
     /** A chunk of decoded text. Always a whole number of UTF-8 characters. */
     fun onToken(text: String)
 
-    /** Generation finished normally, was stopped, or hit the token limit. */
-    fun onDone(tokenCount: Int, elapsedMs: Long)
+    /**
+     * Generation finished normally, was stopped, or hit the token limit.
+     *
+     * [drafted] and [accepted] are zero unless speculative decoding ran; their
+     * ratio is what says whether it was worth its memory.
+     */
+    fun onDone(tokenCount: Int, elapsedMs: Long, drafted: Int, accepted: Int)
 
     /** Terminal failure. [message] is `CODE|human readable text`. */
     fun onError(message: String)

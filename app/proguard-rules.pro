@@ -19,7 +19,7 @@
 -keep interface org.zzssg.llmchatapp.llm.TokenSink { *; }
 -keep class * implements org.zzssg.llmchatapp.llm.TokenSink {
     void onToken(java.lang.String);
-    void onDone(int, long);
+    void onDone(int, long, int, int);
     void onError(java.lang.String);
 }
 

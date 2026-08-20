@@ -61,6 +61,10 @@ data class LoadedModel(
     val supportsThinking: Boolean,
     /** Draft depth in use for speculative decoding; 0 when not running. */
     val mtpDraft: Int = 0,
+    /** Parameter count, used to decide whether speculation fits in memory. */
+    val params: Long = 0,
+    /** Whether the model ships a draft head at all. */
+    val hasMtpBlock: Boolean = false,
 )
 
 /** A failure with a stable code, so the UI can react without matching on prose. */
@@ -69,7 +73,12 @@ class LlamaException(val code: String, message: String) : Exception(message)
 /** Emitted while a response streams in. */
 sealed interface GenerationEvent {
     data class Token(val text: String) : GenerationEvent
-    data class Done(val tokenCount: Int, val elapsedMs: Long) : GenerationEvent
+    data class Done(
+        val tokenCount: Int,
+        val elapsedMs: Long,
+        val drafted: Int = 0,
+        val accepted: Int = 0,
+    ) : GenerationEvent
 }
 
 /**
@@ -112,6 +121,8 @@ class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
             contextSize = nativeContextSize(),
             supportsThinking = nativeSupportsThinking(),
             mtpDraft = nativeMtpDraft(),
+            params = nativeModelParams(),
+            hasMtpBlock = nativeHasMtpBlock(),
         )
     }
 
@@ -169,8 +180,8 @@ class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
                     trySend(GenerationEvent.Token(text))
                 }
 
-                override fun onDone(tokenCount: Int, elapsedMs: Long) {
-                    trySend(GenerationEvent.Done(tokenCount, elapsedMs))
+                override fun onDone(tokenCount: Int, elapsedMs: Long, drafted: Int, accepted: Int) {
+                    trySend(GenerationEvent.Done(tokenCount, elapsedMs, drafted, accepted))
                     close()
                 }
 

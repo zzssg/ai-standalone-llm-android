@@ -11,6 +11,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import android.app.ActivityManager
+import android.content.Context
 import org.zzssg.llmchatapp.data.AppSettings
 import org.zzssg.llmchatapp.data.ChatStore
 import org.zzssg.llmchatapp.data.ChatSummary
@@ -19,6 +21,8 @@ import org.zzssg.llmchatapp.data.StoredMessage
 import org.zzssg.llmchatapp.data.ImportProgress
 import org.zzssg.llmchatapp.data.ModelFile
 import org.zzssg.llmchatapp.data.ModelStore
+import org.zzssg.llmchatapp.data.MtpDecision
+import org.zzssg.llmchatapp.data.MtpPolicy
 import org.zzssg.llmchatapp.data.SettingsStore
 import org.zzssg.llmchatapp.llm.ChatTurn
 import org.zzssg.llmchatapp.llm.GenerationEvent
@@ -44,7 +48,15 @@ data class ChatMessage(
     val isUser: Boolean get() = role == ChatTurn.ROLE_USER
 }
 
-data class GenerationStats(val tokenCount: Int, val elapsedMs: Long) {
+data class GenerationStats(
+    val tokenCount: Int,
+    val elapsedMs: Long,
+    val drafted: Int = 0,
+    val accepted: Int = 0,
+) {
+    /** Share of drafted tokens the model kept; null when speculation did not run. */
+    val acceptance: Double? get() = if (drafted > 0) accepted.toDouble() / drafted else null
+
     val tokensPerSecond: Double =
         if (elapsedMs > 0) tokenCount * 1000.0 / elapsedMs else 0.0
 
@@ -91,6 +103,8 @@ data class ChatUiState(
     val nativeAvailable: Boolean = true,
     val chats: List<ChatSummary> = emptyList(),
     val activeChatId: String? = null,
+    val mtpDecision: MtpDecision? = null,
+    val totalRamBytes: Long = 0,
 ) {
     val isReady: Boolean get() = activeModel != null
     val isBusy: Boolean get() = modelState != ModelUiState.Idle
@@ -114,6 +128,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val settingsStore = SettingsStore(app)
     private val chatStore = ChatStore(app)
 
+    /**
+     * Physical RAM, one of the two inputs to the speculation decision. Read once:
+     * it cannot change while the app runs.
+     */
+    private val totalRamBytes: Long = run {
+        val am = app.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }.totalMem
+    }
+
     private val _state = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
 
@@ -121,7 +144,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         val settings = settingsStore.load()
-        _state.update { it.copy(settings = settings, nativeAvailable = engine.isAvailable) }
+        _state.update {
+            it.copy(settings = settings, nativeAvailable = engine.isAvailable, totalRamBytes = totalRamBytes)
+        }
         refreshModels(autoLoadId = settings.lastModelId)
         refreshChats()
     }
@@ -265,11 +290,31 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
             try {
                 val settings = _state.value.settings
-                val loaded = engine.load(
+
+                // The policy needs the model's parameter count, which is only
+                // known once it is open. Load without speculation first, decide,
+                // and reload only when the answer is yes -- reloading costs
+                // seconds, so it is not done speculatively itself.
+                var loaded = engine.load(
                     file = model.file,
                     threads = settings.threads,
                     contextSize = settings.contextSize,
                 )
+
+                val decision = MtpPolicy.decide(
+                    mode = settings.mtp,
+                    totalRamBytes = totalRamBytes,
+                    modelParams = loaded.params,
+                    modelHasMtpBlock = loaded.hasMtpBlock,
+                )
+                if (decision.enabled) {
+                    loaded = engine.load(
+                        file = model.file,
+                        threads = settings.threads,
+                        contextSize = settings.contextSize,
+                        mtpDraft = decision.draft,
+                    )
+                }
                 engine.applySampling(settings.sampling)
 
                 val updatedSettings = settings.copy(lastModelId = model.id)
@@ -278,6 +323,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update {
                     it.copy(
                         activeModel = loaded,
+                        mtpDecision = decision,
                         modelState = ModelUiState.Idle,
                         settings = updatedSettings,
                         // Reopening the same model for a settings change keeps the
@@ -355,7 +401,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             it.copy(
                                 text = builder.toString(),
                                 streaming = false,
-                                stats = GenerationStats(event.tokenCount, event.elapsedMs),
+                                stats = GenerationStats(
+                                    tokenCount = event.tokenCount,
+                                    elapsedMs = event.elapsedMs,
+                                    drafted = event.drafted,
+                                    accepted = event.accepted,
+                                ),
                             )
                         }
                     }

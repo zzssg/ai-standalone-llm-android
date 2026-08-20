@@ -104,11 +104,18 @@ private fun MessageFooter(message: ChatMessage, onCopy: () -> Unit) {
             // build appended "[stats] avg_ms=... tps=..." to the reply text
             // itself, so the user read debug output as part of the answer.
             Text(
-                text = "%d tokens · %s · %.1f tok/s".format(
-                    stats.tokenCount,
-                    stats.formattedDuration,
-                    stats.tokensPerSecond,
-                ),
+                text = buildString {
+                    append(
+                        "%d tokens · %s · %.1f tok/s".format(
+                            stats.tokenCount,
+                            stats.formattedDuration,
+                            stats.tokensPerSecond,
+                        )
+                    )
+                    // Only present when speculative decoding ran. It is the number
+                    // that says whether the extra memory paid for itself.
+                    stats.acceptance?.let { append(" · %.0f%% drafted".format(it * 100)) }
+                },
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

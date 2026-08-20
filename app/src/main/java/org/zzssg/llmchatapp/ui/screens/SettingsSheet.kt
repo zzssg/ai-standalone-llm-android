@@ -20,6 +20,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.outlined.Tune
@@ -52,6 +53,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import org.zzssg.llmchatapp.data.AppSettings
+import org.zzssg.llmchatapp.data.MtpDecision
+import org.zzssg.llmchatapp.data.MtpMode
 import org.zzssg.llmchatapp.llm.SamplingConfig
 import org.zzssg.llmchatapp.llm.ThinkingMode
 import org.zzssg.llmchatapp.ui.theme.MinTouchTarget
@@ -72,6 +75,7 @@ import kotlin.math.roundToInt
 fun SettingsSheet(
     settings: AppSettings,
     canToggleThinking: Boolean,
+    mtpDecision: MtpDecision?,
     onApply: (AppSettings) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -79,7 +83,9 @@ fun SettingsSheet(
     var draft by remember { mutableStateOf(settings) }
     var showAdvanced by remember { mutableStateOf(false) }
 
-    val needsReload = draft.contextSize != settings.contextSize || draft.threads != settings.threads
+    val needsReload = draft.contextSize != settings.contextSize ||
+        draft.threads != settings.threads ||
+        draft.mtp != settings.mtp
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
         Column(
@@ -207,6 +213,20 @@ fun SettingsSheet(
                     onChange = { draft = draft.copy(threads = it.roundToInt()) },
                 )
 
+                Spacer(Modifier.height(Spacing.md))
+                SettingLabel(
+                    title = "Speculative decoding",
+                    description = "A small extra head guesses the next few tokens and the " +
+                        "model confirms them in one pass. Faster, but it holds about " +
+                        "700 MB more memory.",
+                )
+                Spacer(Modifier.height(Spacing.sm))
+                MtpSelector(
+                    mode = draft.mtp,
+                    onChange = { draft = draft.copy(mtp = it) },
+                )
+                mtpDecision?.let { DecisionNote(it) }
+
                 // Only shown once a reload is actually pending, so it reads as a
                 // consequence of what was just changed rather than a standing warning.
                 AnimatedVisibility(visible = needsReload) {
@@ -290,6 +310,56 @@ private fun ThinkingSelector(mode: ThinkingMode, onChange: (ThinkingMode) -> Uni
                     Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 },
             )
+        }
+    }
+}
+
+/**
+ * Auto is the default and the honest one: whether speculation pays off depends
+ * on this phone's memory and this model's size, and the app knows both. On and
+ * Off are there for anyone who wants to measure the difference themselves.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MtpSelector(mode: MtpMode, onChange: (MtpMode) -> Unit) {
+    val options = listOf(
+        MtpMode.AUTO to "Auto",
+        MtpMode.ON to "On",
+        MtpMode.OFF to "Off",
+    )
+
+    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+        options.forEachIndexed { index, (value, label) ->
+            SegmentedButton(
+                selected = mode == value,
+                onClick = { onChange(value) },
+                shape = SegmentedButtonDefaults.itemShape(index, options.size),
+                icon = { if (mode == value) SegmentedButtonDefaults.Icon(active = true) },
+                label = { Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            )
+        }
+    }
+}
+
+/** What the policy decided and why, so Auto is not a black box. */
+@Composable
+private fun DecisionNote(decision: MtpDecision) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = Spacing.sm),
+    ) {
+        Row(Modifier.padding(Spacing.md), verticalAlignment = Alignment.Top) {
+            Icon(
+                imageVector = if (decision.enabled) Icons.Outlined.Bolt else Icons.Outlined.Info,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+            )
+            Spacer(Modifier.size(Spacing.sm))
+            Text(decision.reason, style = MaterialTheme.typography.bodySmall)
         }
     }
 }

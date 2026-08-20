@@ -372,7 +372,7 @@ struct java_callback {
         jclass cls = e->GetObjectClass(o);
         if (!cls) return false;
         on_token = e->GetMethodID(cls, "onToken", "(Ljava/lang/String;)V");
-        on_done  = e->GetMethodID(cls, "onDone",  "(IJ)V");
+        on_done  = e->GetMethodID(cls, "onDone",  "(IJII)V");
         on_error = e->GetMethodID(cls, "onError", "(Ljava/lang/String;)V");
         e->DeleteLocalRef(cls);
         return on_token && on_done && on_error;
@@ -385,8 +385,11 @@ struct java_callback {
         env->DeleteLocalRef(js);
     }
 
-    void done(int n_tokens, long long elapsed_ms) const {
-        if (on_done) env->CallVoidMethod(obj, on_done, (jint) n_tokens, (jlong) elapsed_ms);
+    void done(int n_tokens, long long elapsed_ms, int drafted, int accepted) const {
+        if (on_done) {
+            env->CallVoidMethod(obj, on_done, (jint) n_tokens, (jlong) elapsed_ms,
+                                (jint) drafted, (jint) accepted);
+        }
     }
 
     void error(const std::string & msg) const {
@@ -1244,7 +1247,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
 
     g_stop_requested.store(false);
     g_generating.store(false);
-    cb.done(n_generated, (long long) elapsed);
+    cb.done(n_generated, (long long) elapsed, n_drafted, n_accepted);
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *, void *) {
