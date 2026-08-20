@@ -1,891 +1,899 @@
+// JNI bridge between the Compose UI and llama.cpp.
+//
+// Threading contract: nativeGenerate() runs synchronously on the calling thread.
+// Kotlin invokes it from Dispatchers.IO inside a coroutine, so there is no reason
+// to spawn a pthread here and attach it to the JVM. Cancellation is cooperative:
+// nativeStop() raises a flag that the decode loop polls between tokens.
+
 #include <jni.h>
-#include <string.h>
 #include <android/log.h>
-#include <pthread.h>
-#include <semaphore.h>
-#include <stdlib.h>  // For malloc and free
-#include <unistd.h> // for sysconf to detect CPU count on Android
-#include <vector>
-#include <strings.h>
-#include <chrono>
+#include <unistd.h>
+#include <string.h>
 #include <stdio.h>
 
-// Include llama.cpp headers using the correct paths
-#include "lib/llama.cpp/ggml/include/ggml.h"
-#include "lib/llama.cpp/ggml/include/ggml-cpu.h"
-#include "lib/llama.cpp/ggml/include/ggml-backend.h"
-#include "lib/llama.cpp/include/llama.h"
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <string>
+#include <vector>
 
-#define LOG_TAG "LLAMA_ANDROID"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "gguf.h"
+#include "llama.h"
+
+#define LOG_TAG "LlamaWrapper"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Global JVM reference for thread attachment
-static JavaVM* g_jvm = NULL;
+namespace {
 
-// Forward declaration
-typedef struct {
-    JNIEnv* env;
-    jobject callback; // Java callback object (onComplete or onProgress)
-    jmethodID onResultMethodId;
-    jmethodID onErrorMethodId;
-    jmethodID onProgressMethodId;
-    char prompt[4096];
-    int max_tokens;
-} inference_context_t;
+// ---------------------------------------------------------------------------
+// Global model state
+// ---------------------------------------------------------------------------
 
-// Global state (protected by mutex)
-static struct llama_model* g_model = NULL;
-static struct llama_context* g_ctx = NULL;
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static volatile int g_inference_active = 0; // Thread safety flag
+// g_lock guards every mutation of the model/context/sampler below. It is held for
+// the whole duration of a generation, so nothing the UI thread calls may take it
+// -- see g_model_loaded for the lock-free "is it ready?" query.
+std::mutex g_lock;
 
-// Add global variables to store sampling parameters
-static int g_threads = 4;
-static int g_batch_size = 512;
-static int g_ctx_size = 2048;
-static float g_temp = 0.8f;
-static float g_top_p = 0.95f;
-static int g_top_k = 40;  // New parameter
-static float g_min_p = 0.05f;  // New parameter (mi_k might be min_p)
-static float g_repeat_penalty = 1.1f;
-static bool g_flash_attn = false;  // New parameter for flash attention
+llama_model   * g_model   = nullptr;
+llama_context * g_ctx     = nullptr;
+llama_sampler * g_sampler = nullptr;
 
-// Progress reporting interval: send onProgress every N tokens (reduce log spam)
-static int g_progress_interval = 5;
+// Read from the UI thread on every recomposition, so these must never block.
+std::atomic<bool> g_model_loaded{false};
+std::atomic<bool> g_generating{false};
+std::atomic<bool> g_stop_requested{false};
 
-// Add a flag to track if sampler is initialized
-static bool g_sampler_initialized = false;
-static struct llama_sampler* g_sampler = NULL;
+// Tokens currently resident in the KV cache of sequence 0, used to reuse the
+// common prefix between turns instead of reprocessing the whole conversation.
+std::vector<llama_token> g_cached_tokens;
 
-// Preferred devices array (NULL-terminated) allocated at init and freed in nativeFree
-static ggml_backend_dev_t * g_preferred_devices = NULL;
+struct sampling_params {
+    float    temp           = 0.7f;
+    float    top_p          = 0.95f;
+    int32_t  top_k          = 40;
+    float    min_p          = 0.05f;
+    float    repeat_penalty = 1.1f;
+    int32_t  repeat_last_n  = 64;
+    uint32_t seed           = LLAMA_DEFAULT_SEED;
+};
 
-// Build a NULL-terminated list of preferred devices: Vulkan -> OpenCL -> GPU -> IGPU -> CPU
-static void build_preferred_devices() {
-    // Free previous if any
-    if (g_preferred_devices) {
-        free(g_preferred_devices);
-        g_preferred_devices = NULL;
-    }
+sampling_params g_sparams;
 
-    // Try to load any dynamic backends (no-op if built-in)
-    ggml_backend_load_all();
+constexpr size_t MAX_LOG_CAPTURE = 8192;
 
-    size_t ndev = ggml_backend_dev_count();
-    if (ndev == 0) return;
+// Errors llama.cpp logged during the current load. It reports precisely why a
+// load failed, then swallows the exception, leaving the JNI layer with only a
+// NULL model. Keeping the text lets us tell an unsupported architecture apart
+// from a truncated download instead of guessing.
+//
+// These are accumulated rather than overwritten: llama.cpp emits a log line in
+// several callback invocations, and a trailing fragment would otherwise replace
+// the part that names the cause.
+std::mutex  g_log_lock;
+std::string g_log_errors;
 
-    std::vector<ggml_backend_dev_t> vulkan;
-    std::vector<ggml_backend_dev_t> opencl;
-    std::vector<ggml_backend_dev_t> gpus;
-    std::vector<ggml_backend_dev_t> igpus;
-    std::vector<ggml_backend_dev_t> cpus;
+// ---------------------------------------------------------------------------
+// String helpers
+//
+// JNI's NewStringUTF/GetStringUTFChars speak *modified* UTF-8, which differs from
+// real UTF-8 for U+0000 and for every character above the BMP. Model output
+// routinely contains emoji (4-byte UTF-8), and handing those to NewStringUTF is
+// undefined behaviour that aborts the VM on ART. So we convert by hand in both
+// directions and use GetStringChars/NewString, which are plain UTF-16.
+// ---------------------------------------------------------------------------
 
-    for (size_t i = 0; i < ndev; ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-        const char * reg_name = ggml_backend_reg_name(reg);
-        switch (ggml_backend_dev_type(dev)) {
-            case GGML_BACKEND_DEVICE_TYPE_GPU:
-                if (reg_name && strcasecmp(reg_name, "Vulkan") == 0) {
-                    vulkan.push_back(dev);
-                } else if (reg_name && strcasecmp(reg_name, "OpenCL") == 0) {
-                    opencl.push_back(dev);
-                } else {
-                    gpus.push_back(dev);
-                }
-                break;
-            case GGML_BACKEND_DEVICE_TYPE_IGPU:
-                igpus.push_back(dev);
-                break;
-            case GGML_BACKEND_DEVICE_TYPE_CPU:
-            case GGML_BACKEND_DEVICE_TYPE_ACCEL:
-            default:
-                cpus.push_back(dev);
-                break;
-        }
-    }
+std::string jstring_to_utf8(JNIEnv * env, jstring jstr) {
+    std::string out;
+    if (!jstr) return out;
 
-    // Combine in order of preference
-    std::vector<ggml_backend_dev_t> order;
-    order.insert(order.end(), vulkan.begin(), vulkan.end());
-    order.insert(order.end(), opencl.begin(), opencl.end());
-    order.insert(order.end(), gpus.begin(), gpus.end());
-    order.insert(order.end(), igpus.begin(), igpus.end());
-    order.insert(order.end(), cpus.begin(), cpus.end());
+    const jsize   len = env->GetStringLength(jstr);
+    const jchar * raw = env->GetStringChars(jstr, nullptr);
+    if (!raw) return out;
 
-    // allocate NULL-terminated array
-    g_preferred_devices = (ggml_backend_dev_t *) malloc(sizeof(ggml_backend_dev_t) * (order.size() + 1));
-    if (!g_preferred_devices) return;
-    for (size_t i = 0; i < order.size(); ++i) {
-        g_preferred_devices[i] = order[i];
-    }
-    g_preferred_devices[order.size()] = NULL;
-}
-
-// --- Helper: Safe JNI String to C ---
-static char* jstringToUtf8(JNIEnv *env, jstring jstr) {
-    if (!jstr) return NULL;
-
-    jsize len = env->GetStringLength(jstr);   // length in UTF-16 units
-    const jchar* raw = env->GetStringChars(jstr, NULL);
-
-    // Max 4 bytes/char + \0
-    int bufsize = len * 4 + 1;
-    char* utf8 = (char*) malloc(bufsize);
-    char* out = utf8;
-
-    for (int i = 0; i < len; i++) {
-        unsigned int code = raw[i];
-
-        if (code >= 0xD800 && code <= 0xDBFF) {            // high surrogate
-            if (i + 1 < len) {
-                unsigned int low = raw[i + 1];
-                if (low >= 0xDC00 && low <= 0xDFFF) {      // low surrogate
-                    code = 0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
-                    i++; // skip low
-                }
+    out.reserve((size_t) len * 3);
+    for (jsize i = 0; i < len; ++i) {
+        uint32_t cp = raw[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < len) {
+            const uint32_t low = raw[i + 1];
+            if (low >= 0xDC00 && low <= 0xDFFF) {
+                cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00));
+                ++i;
             }
         }
-
-        // Encode UTF-8
-        if (code < 0x80) {
-            *out++ = (char) code;
-        } else if (code < 0x800) {
-            *out++ = (char) (0xC0 | (code >> 6));
-            *out++ = (char) (0x80 | (code & 0x3F));
-        } else if (code < 0x10000) {
-            *out++ = (char) (0xE0 | (code >> 12));
-            *out++ = (char) (0x80 | ((code >> 6) & 0x3F));
-            *out++ = (char) (0x80 | (code & 0x3F));
-        } else { // U+10000..U+10FFFF
-            *out++ = (char) (0xF0 | (code >> 18));
-            *out++ = (char) (0x80 | ((code >> 12) & 0x3F));
-            *out++ = (char) (0x80 | ((code >> 6) & 0x3F));
-            *out++ = (char) (0x80 | (code & 0x3F));
+        if (cp < 0x80) {
+            out.push_back((char) cp);
+        } else if (cp < 0x800) {
+            out.push_back((char) (0xC0 | (cp >> 6)));
+            out.push_back((char) (0x80 | (cp & 0x3F)));
+        } else if (cp < 0x10000) {
+            out.push_back((char) (0xE0 | (cp >> 12)));
+            out.push_back((char) (0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back((char) (0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back((char) (0xF0 | (cp >> 18)));
+            out.push_back((char) (0x80 | ((cp >> 12) & 0x3F)));
+            out.push_back((char) (0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back((char) (0x80 | (cp & 0x3F)));
         }
     }
 
-    *out = '\0';
     env->ReleaseStringChars(jstr, raw);
-    return utf8;
+    return out;
 }
 
-// --- Helper: Free C string safely ---
-static void freeIfNotNull(char* ptr) {
-    if (ptr) {
-        free(ptr);
-        ptr = NULL;
+jstring utf8_to_jstring(JNIEnv * env, const char * s, size_t len) {
+    std::vector<jchar> u16;
+    u16.reserve(len);
+
+    size_t i = 0;
+    while (i < len) {
+        const unsigned char c = (unsigned char) s[i];
+        uint32_t cp;
+        size_t   extra;
+
+        if      (c < 0x80)           { cp = c;        extra = 0; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; extra = 1; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; extra = 2; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; extra = 3; }
+        else { ++i; continue; } // stray continuation byte or invalid lead
+
+        if (i + extra >= len) break; // truncated sequence at end of buffer
+
+        bool ok = true;
+        for (size_t k = 1; k <= extra; ++k) {
+            const unsigned char cc = (unsigned char) s[i + k];
+            if ((cc & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        i += extra + 1;
+        if (!ok || cp > 0x10FFFF) continue;
+
+        if (cp >= 0x10000) {
+            cp -= 0x10000;
+            u16.push_back((jchar) (0xD800 + (cp >> 10)));
+            u16.push_back((jchar) (0xDC00 + (cp & 0x3FF)));
+        } else {
+            u16.push_back((jchar) cp);
+        }
     }
+
+    return env->NewString(u16.data(), (jsize) u16.size());
 }
 
-// --- Thread Function for Inference ---
-void* inference_thread(void* arg) {
-    inference_context_t* ctx_data = (inference_context_t*)arg;
-
-    JNIEnv* env = NULL;
-    int attached = g_jvm->AttachCurrentThread(&env, NULL);
-    if (attached != JNI_OK) {
-        LOGE("Failed to attach thread");
-        free(ctx_data);
-        return NULL;
-    } else {
-        LOGI("AttachCurrentThread done!");
-    }
-
-    pthread_mutex_lock(&g_lock);
-
-    // Ensure model is loaded
-    if (!g_model || !g_ctx) {
-        LOGE("Model not initialized!");
-        if (ctx_data->onErrorMethodId) {
-            env->CallVoidMethod(ctx_data->callback,
-                               ctx_data->onErrorMethodId,
-                               env->NewStringUTF("Error: Model not loaded"));
-        }
-        pthread_mutex_unlock(&g_lock);
-        // delete global ref while thread still attached and env valid
-        if (ctx_data->callback) {
-            env->DeleteGlobalRef(ctx_data->callback);
-            ctx_data->callback = NULL;
-        }
-
-        // detach the thread (only if it was attached here)
-        if (attached == JNI_OK) {
-            g_jvm->DetachCurrentThread();
-        }
-        free(ctx_data);
-        return NULL;
-    } else {
-        LOGI("Model initialized!");
-    }
-
-    // Get vocabulary from model
-    const struct llama_vocab* vocab = llama_model_get_vocab(g_model);
-    if (!vocab) {
-        LOGE("Failed to get vocabulary from model!");
-        if (ctx_data->onErrorMethodId) {
-            env->CallVoidMethod(ctx_data->callback,
-                               ctx_data->onErrorMethodId,
-                               env->NewStringUTF("Error: Failed to get vocabulary from model"));
-        }
-        pthread_mutex_unlock(&g_lock);
-        // delete global ref while thread still attached and env valid
-        if (ctx_data->callback) {
-            env->DeleteGlobalRef(ctx_data->callback);
-            ctx_data->callback = NULL;
-        }
-
-        // detach the thread (only if it was attached here)
-        if (attached == JNI_OK) {
-            g_jvm->DetachCurrentThread();
-        }
-        free(ctx_data);
-        return NULL;
-    } else {
-        LOGI("Got vocabulary from model");
-    }
-    
-    // Tokenize prompt
-    int prompt_len = strlen(ctx_data->prompt);
-    LOGI("Before llama_tokenize (count)");
-    int n_tokens = -llama_tokenize(vocab, ctx_data->prompt, prompt_len, NULL, 0, true, false);
-    LOGI("After llama_tokenize (count), n_tokens=%d", n_tokens);
-    if (n_tokens <= 0) {
-        LOGE("Tokenization failed!");
-        if (ctx_data->onErrorMethodId) {
-            env->CallVoidMethod(ctx_data->callback,
-                               ctx_data->onErrorMethodId,
-                               env->NewStringUTF("Error: Tokenization failed"));
-        }
-        pthread_mutex_unlock(&g_lock);
-        // delete global ref while thread still attached and env valid
-        if (ctx_data->callback) {
-            env->DeleteGlobalRef(ctx_data->callback);
-            ctx_data->callback = NULL;
-        }
-
-        // detach the thread (only if it was attached here)
-        if (attached == JNI_OK) {
-            g_jvm->DetachCurrentThread();
-        }
-        free(ctx_data);
-        return NULL;
-    } else {
-        LOGI("Tokenization completed. n_tokens=%d", n_tokens);
-    }
-
-    LOGI("Before llama_batch_init");
-    struct llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    LOGI("After llama_batch_init");
-    llama_token* tokens = (llama_token*) malloc(sizeof(llama_token) * n_tokens);
-    LOGI("Before llama_tokenize (real)");
-    llama_tokenize(vocab, ctx_data->prompt, prompt_len, tokens, n_tokens, true, false);
-    LOGI("After llama_tokenize (real)");
-    for (int i = 0; i < n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = false;
-    }
-    batch.logits[n_tokens - 1] = true; // Only the last token logits are needed
-    batch.n_tokens = n_tokens;
-
-    free(tokens);
-
-    // Process prompt
-    if (llama_decode(g_ctx, batch) != 0) {
-        LOGE("Failed to process prompt");
-        if (ctx_data->onErrorMethodId) {
-            env->CallVoidMethod(ctx_data->callback,
-                               ctx_data->onErrorMethodId,
-                               env->NewStringUTF("Error: Failed to process prompt"));
-        }
-        llama_batch_free(batch);
-        pthread_mutex_unlock(&g_lock);
-        // delete global ref while thread still attached and env valid
-        if (ctx_data->callback) {
-            env->DeleteGlobalRef(ctx_data->callback);
-            ctx_data->callback = NULL;
-        }
-
-        // detach the thread (only if it was attached here)
-        if (attached == JNI_OK) {
-            g_jvm->DetachCurrentThread();
-        }
-        free(ctx_data);
-        return NULL;
-    }
-
-    // Generate response
-    char* output = (char*) malloc(4096);
-    if (!output) {
-        LOGE("Memory allocation failed for output");
-        if (ctx_data->onErrorMethodId) {
-            env->CallVoidMethod(ctx_data->callback,
-                               ctx_data->onErrorMethodId,
-                               env->NewStringUTF("Error: Memory allocation failed"));
-        }
-        llama_batch_free(batch);
-        pthread_mutex_unlock(&g_lock);
-        // delete global ref while thread still attached and env valid
-        if (ctx_data->callback) {
-            env->DeleteGlobalRef(ctx_data->callback);
-            ctx_data->callback = NULL;
-        }
-
-        // detach the thread (only if it was attached here)
-        if (attached == JNI_OK) {
-            g_jvm->DetachCurrentThread();
-        }
-        free(ctx_data);
-        return NULL;
-    }
-    memset(output, 0, 4096);
-
-    int n_generated = 0;
-    bool done = false;
-
-    // Timing statistics for generation (ms)
-    double total_decode_ms = 0.0;
-    int timed_tokens = 0;
-
-    // Initialize or reset sampling with the parameters
-    if (!g_sampler_initialized || !g_sampler) {
-        g_sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-        if (!g_sampler) {
-            LOGE("Failed to initialize sampler");
-            if (ctx_data->onErrorMethodId) {
-                env->CallVoidMethod(ctx_data->callback,
-                                   ctx_data->onErrorMethodId,
-                                   env->NewStringUTF("Error: Failed to initialize sampler"));
-            }
-            free(output);
-            llama_batch_free(batch);
-            pthread_mutex_unlock(&g_lock);
-            // delete global ref while thread still attached and env valid
-            if (ctx_data->callback) {
-                env->DeleteGlobalRef(ctx_data->callback);
-                ctx_data->callback = NULL;
-            }
-
-            // detach the thread (only if it was attached here)
-            if (attached == JNI_OK) {
-                g_jvm->DetachCurrentThread();
-            }
-            free(ctx_data);
-            return NULL;
-        }
-        g_sampler_initialized = true;
-        
-        // Apply the sampling parameters in order
-        
-        // Top-K sampling (new parameter)
-        if (g_top_k > 0) {
-            llama_sampler_chain_add(g_sampler, llama_sampler_init_top_k(g_top_k));
-        }
-        
-        // Top-p (nucleus) sampling
-        if (g_top_p < 1.0f) {
-            llama_sampler_chain_add(g_sampler, llama_sampler_init_top_p(g_top_p, 1));
-        }
-        
-        // Min-P sampling (new parameter)
-        if (g_min_p > 0.0f) {
-            llama_sampler_chain_add(g_sampler, llama_sampler_init_min_p(g_min_p, 1));
-        }
-        
-        // Temperature sampling
-        if (g_temp != 0.0f) {
-            llama_sampler_chain_add(g_sampler, llama_sampler_init_temp(g_temp));
-        }
-        
-        // Repeat penalty
-        if (g_repeat_penalty != 1.0f) {
-            llama_sampler_chain_add(g_sampler, llama_sampler_init_penalties(
-                64,                   // last n tokens to penalize
-                g_repeat_penalty,     // penalty_repeat
-                0.0f,                 // penalty_freq
-                0.0f                  // penalty_present
-            ));
-        }
-        
-        // Distribution sampler (required)
-        struct llama_sampler * dist_sampler = llama_sampler_init_dist(1234);
-        if (!dist_sampler) {
-            LOGE("Failed to initialize distribution sampler");
-            if (ctx_data->onErrorMethodId) {
-                env->CallVoidMethod(ctx_data->callback,
-                                   ctx_data->onErrorMethodId,
-                                   env->NewStringUTF("Error: Failed to initialize distribution sampler"));
-            }
-            llama_sampler_free(g_sampler);
-            g_sampler = NULL;
-            g_sampler_initialized = false;
-            free(output);
-            llama_batch_free(batch);
-            pthread_mutex_unlock(&g_lock);
-            // delete global ref while thread still attached and env valid
-            if (ctx_data->callback) {
-                env->DeleteGlobalRef(ctx_data->callback);
-                ctx_data->callback = NULL;
-            }
-
-            // detach the thread (only if it was attached here)
-            if (attached == JNI_OK) {
-                g_jvm->DetachCurrentThread();
-            }
-            free(ctx_data);
-            return NULL;
-        }
-        
-        llama_sampler_chain_add(g_sampler, dist_sampler);
-    } else {
-        // Reset the sampler state for new generation
-        llama_sampler_reset(g_sampler);
-    }
-
-    auto gen_start = std::chrono::steady_clock::now();
-    while (n_generated < ctx_data->max_tokens && !done) {
-        // Sample next token
-        llama_token new_token_id = llama_sampler_sample(g_sampler, g_ctx, -1);
-        
-        // Check if sampling was successful
-        if (new_token_id == -1) {
-            LOGE("Failed to sample next token");
-            break;
-        }
-        
-        // Accept the token (updates sampler state)
-        llama_sampler_accept(g_sampler, new_token_id);
-
-        // Check if it's an end-of-generation token
-        if (llama_vocab_is_eog(vocab, new_token_id)) {
-            done = true;
-            break;
-        }
-        
-        // Additional safety check for valid token
-        if (new_token_id < 0) {
-            LOGE("Invalid token ID: %d", new_token_id);
-            break;
-        }
-
-        // Convert token to string
-        char token_str[512];
-        int token_str_len = llama_token_to_piece(vocab, new_token_id, token_str, sizeof(token_str), 0, false);
-        if (token_str_len > 0) {
-            token_str[token_str_len] = '\0';
-            
-            // Check for buffer overflow before concatenating
-            size_t output_len = strlen(output);
-            size_t token_len = strlen(token_str);
-            if (output_len + token_len >= 4095) {
-                LOGE("Output buffer full");
-                break;
-            }
-            
-            strcat(output, token_str);
-        }
-
-        // Notify progress - changed from every 5 tokens to every token for more frequent updates
-        if (ctx_data->onProgressMethodId) {
-            // Send progress only every g_progress_interval tokens to reduce log spam.
-            if ((n_generated > 0 && (n_generated % g_progress_interval) == 0) || (timed_tokens > 0 && (timed_tokens % g_progress_interval) == 0)) {
-                // Compose a message containing the partial output and timing stats
-                char progress_buf[8192];
-                double avg_ms = timed_tokens > 0 ? (total_decode_ms / (double) timed_tokens) : 0.0;
-                double tps = avg_ms > 0.0 ? 1000.0 / avg_ms : 0.0;
-                // Ensure we don't overflow the buffer
-                int written = snprintf(progress_buf, sizeof(progress_buf), "%s\n[stats] avg_ms=%.2f tps=%.2f tokens=%d", output, avg_ms, tps, n_generated);
-                if (written < 0) {
-                    // fallback to sending only output
-                    jstring js = env->NewStringUTF(output);
-                    env->CallVoidMethod(ctx_data->callback, ctx_data->onProgressMethodId, js);
-                    env->DeleteLocalRef(js);
-                } else {
-                    jstring js = env->NewStringUTF(progress_buf);
-                    env->CallVoidMethod(ctx_data->callback, ctx_data->onProgressMethodId, js);
-                    env->DeleteLocalRef(js);
-                }
-            }
-        }
-
-        // Prepare next batch
-        struct llama_batch next_batch = llama_batch_init(1, 0, 1);
-        next_batch.token[0] = new_token_id;
-        next_batch.pos[0] = n_tokens + n_generated;
-        next_batch.n_seq_id[0] = 1;
-        next_batch.seq_id[0][0] = 0;
-        next_batch.logits[0] = true;
-        next_batch.n_tokens = 1;
-
-        // Time the decode call (this is the main per-token work)
-        auto t0 = std::chrono::steady_clock::now();
-        int decode_res = llama_decode(g_ctx, next_batch);
-        auto t1 = std::chrono::steady_clock::now();
-        double decode_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0).count();
-        if (decode_res != 0) {
-            LOGE("Failed to decode token");
-            llama_batch_free(next_batch);
-            break;
-        }
-        llama_batch_free(next_batch);
-
-        // Update timing stats
-        total_decode_ms += decode_ms;
-        ++timed_tokens;
-        double avg_ms = total_decode_ms / (double) timed_tokens;
-        double tokens_per_sec = avg_ms > 0.0 ? 1000.0 / avg_ms : 0.0;
-        // Log only every g_progress_interval tokens to avoid spam
-        if ((timed_tokens % g_progress_interval) == 0) {
-            LOGI("Decode token id=%d decode_ms=%.2f avg_ms=%.2f tokens=%d tps=%.2f", new_token_id, decode_ms, avg_ms, timed_tokens, tokens_per_sec);
-        }
-        ++n_generated;
-    }
-
-    // Generation finished — compute summary timings
-    auto gen_end = std::chrono::steady_clock::now();
-    double total_gen_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(gen_end - gen_start).count();
-    double avg_ms_total = n_generated > 0 ? (total_gen_ms / (double) n_generated) : 0.0;
-    double total_tps = avg_ms_total > 0.0 ? 1000.0 / avg_ms_total : 0.0;
-
-    LOGI("Generation finished: tokens=%d total_ms=%.2f avg_ms=%.2f tps=%.2f", n_generated, total_gen_ms, avg_ms_total, total_tps);
-
-    // Send a final progress message with timing summary (so UI can display it)
-    if (ctx_data->onProgressMethodId) {
-        char summary_buf[8192];
-        int w = snprintf(summary_buf, sizeof(summary_buf), "%s\n[summary] tokens=%d total_ms=%.2f avg_ms=%.2f tps=%.2f", output, n_generated, total_gen_ms, avg_ms_total, total_tps);
-        if (w >= 0) {
-            jstring jsprog = env->NewStringUTF(summary_buf);
-            env->CallVoidMethod(ctx_data->callback, ctx_data->onProgressMethodId, jsprog);
-            env->DeleteLocalRef(jsprog);
-        }
-    }
-
-    // Send final result
-    jstring js = env->NewStringUTF(output);
-    if (ctx_data->onResultMethodId) {
-        env->CallVoidMethod(ctx_data->callback,
-                           ctx_data->onResultMethodId, js);
-    }
-
-    free(output);
-    llama_batch_free(batch);
-
-    pthread_mutex_unlock(&g_lock);
-    // delete global ref while thread still attached and env valid
-    if (ctx_data->callback) {
-        env->DeleteGlobalRef(ctx_data->callback);
-        ctx_data->callback = NULL;
-    }
-
-    // detach the thread (only if it was attached here)
-    if (attached == JNI_OK) {
-        g_jvm->DetachCurrentThread();
-    }
-    free(ctx_data);
-    return NULL;
+jstring utf8_to_jstring(JNIEnv * env, const std::string & s) {
+    return utf8_to_jstring(env, s.data(), s.size());
 }
 
-// --- Java Native Interface: Init Model ---
-extern "C"
-JNIEXPORT jstring JNICALL
-Java_org_zzssg_llmchatapp_LlamaWrapper_nativeInitModel(JNIEnv *env, jclass thiz, jstring modelPath) {
-    const char* path = env->GetStringUTFChars(modelPath, 0);
-    LOGI("Loading model from: %s", path);
-
-    llama_backend_init();
-    // load/initialize available ggml backends and build preferred device list
-    ggml_backend_load_all();
-    build_preferred_devices();
-
-    struct llama_model_params model_params = llama_model_default_params();
-    // prefer Vulkan/OpenCL devices when available
-    model_params.devices = g_preferred_devices;
-    model_params.n_gpu_layers = 0; // No GPU layers for Android
-
-    // load/initialize available ggml backends and build preferred device list
-    ggml_backend_load_all();
-    build_preferred_devices();
-
-    pthread_mutex_lock(&g_lock);
-    g_model = llama_model_load_from_file(path, model_params);
-    if (!g_model) {
-        LOGE("Failed to load model from %s", path);
-        pthread_mutex_unlock(&g_lock);
-        env->ReleaseStringUTFChars(modelPath, path);
-        return env->NewStringUTF("Error: Failed to load model. Please check if the file is a valid GGUF format and accessible.");
+// Length of `s` truncated to the last complete UTF-8 sequence. Streaming deltas
+// arrive one token at a time and a token can end mid-character; emitting the
+// partial bytes renders as a replacement char that then disappears.
+size_t utf8_safe_len(const std::string & s) {
+    const size_t n = s.size();
+    // A sequence is at most 4 bytes, so we never walk back further than that.
+    for (size_t back = 0; back < 4 && back < n; ++back) {
+        const size_t pos = n - 1 - back;
+        const unsigned char c = (unsigned char) s[pos];
+        if ((c & 0xC0) == 0x80) continue; // continuation byte
+        size_t need = 1;
+        if      ((c & 0xE0) == 0xC0) need = 2;
+        else if ((c & 0xF0) == 0xE0) need = 3;
+        else if ((c & 0xF8) == 0xF0) need = 4;
+        return (pos + need <= n) ? n : pos; // complete? emit all : cut before it
     }
-
-    struct llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = 2048;
-    ctx_params.n_threads = 4;
-    ctx_params.n_threads_batch = 4;
-
-    g_ctx = llama_init_from_model(g_model, ctx_params);
-    if (!g_ctx) {
-        LOGE("Failed to create context for model at %s", path);
-        llama_model_free(g_model);
-        g_model = NULL;
-        pthread_mutex_unlock(&g_lock);
-        env->ReleaseStringUTFChars(modelPath, path);
-        return env->NewStringUTF("Error: Failed to create model context. The model might be corrupted or incompatible with this version.");
-    }
-
-    g_inference_active = 1;
-    pthread_mutex_unlock(&g_lock);
-
-    LOGI("Model loaded successfully from %s", path);
-    env->ReleaseStringUTFChars(modelPath, path);
-    return env->NewStringUTF("Success");
+    return n;
 }
 
-// --- Java Native Interface: Init Model With Parameters ---
-extern "C"
-JNIEXPORT jstring JNICALL
-Java_org_zzssg_llmchatapp_LlamaWrapper_nativeInitModelWithParams(
-    JNIEnv *env, 
-    jclass thiz, 
-    jstring modelPath,
-    jint threads,
-    jint batchSize,
-    jint ctxSize,
-    jfloat temp,
-    jfloat topP,
-    jint topK,        // New parameter
-    jfloat minP,      // New parameter
-    jfloat repeatPenalty,
-    jboolean flashAttn) {  // New parameter
-    
-    const char* path = env->GetStringUTFChars(modelPath, 0);
-    LOGI("Loading model from: %s", path);
-    LOGI("Parameters: threads=%d, batch_size=%d, ctx_size=%d, temp=%.2f, top_p=%.2f, top_k=%d, min_p=%.2f, repeat_penalty=%.2f, flash_attn=%s", 
-         threads, batchSize, ctxSize, temp, topP, topK, minP, repeatPenalty, flashAttn ? "true" : "false");
+// ---------------------------------------------------------------------------
+// Callback plumbing
+// ---------------------------------------------------------------------------
 
-    // Store parameters for use in inference
-    // If caller passed threads<=0, autodetect CPU cores and use that as default
-    int cpu_count = 1;
-#if defined(__linux__) || defined(__ANDROID__)
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
-    if (n > 0) cpu_count = (int)n;
-#endif
-    if (threads <= 0) {
-        threads = cpu_count;
-        LOGI("threads not provided or <=0, autodetected cpu_count=%d -> using threads=%d", cpu_count, threads);
-    }
-    g_threads = threads;
-    g_batch_size = batchSize;
-    g_ctx_size = ctxSize;
-    g_temp = temp;
-    g_top_p = topP;
-    g_top_k = topK;              // Store new parameter
-    g_min_p = minP;              // Store new parameter
-    g_repeat_penalty = repeatPenalty;
-    g_flash_attn = flashAttn;    // Store new parameter
+struct java_callback {
+    JNIEnv *  env      = nullptr;
+    jobject   obj      = nullptr;
+    jmethodID on_token = nullptr;
+    jmethodID on_done  = nullptr;
+    jmethodID on_error = nullptr;
 
-    llama_backend_init();
-
-    struct llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 0; // No GPU layers for Android
-    // Prefer Vulkan/OpenCL devices if available (built by build_preferred_devices)
-    model_params.devices = g_preferred_devices;
-    // Apply flash attention if enabled
-    if (g_flash_attn) {
-        // Flash attention settings would go here if supported
-        LOGI("Flash attention setting requested: %s", g_flash_attn ? "true" : "false");
+    bool bind(JNIEnv * e, jobject o) {
+        env = e;
+        obj = o;
+        jclass cls = e->GetObjectClass(o);
+        if (!cls) return false;
+        on_token = e->GetMethodID(cls, "onToken", "(Ljava/lang/String;)V");
+        on_done  = e->GetMethodID(cls, "onDone",  "(IJ)V");
+        on_error = e->GetMethodID(cls, "onError", "(Ljava/lang/String;)V");
+        e->DeleteLocalRef(cls);
+        return on_token && on_done && on_error;
     }
 
-    pthread_mutex_lock(&g_lock);
-    g_model = llama_model_load_from_file(path, model_params);
-    if (!g_model) {
-        LOGE("Failed to load model from %s", path);
-        pthread_mutex_unlock(&g_lock);
-        env->ReleaseStringUTFChars(modelPath, path);
-        return env->NewStringUTF("Error: Failed to load model. Please check if the file is a valid GGUF format and accessible.");
+    void token(const std::string & piece) const {
+        if (!on_token || piece.empty()) return;
+        jstring js = utf8_to_jstring(env, piece);
+        env->CallVoidMethod(obj, on_token, js);
+        env->DeleteLocalRef(js);
     }
 
-    struct llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = ctxSize;
-    ctx_params.n_batch = batchSize;
-    ctx_params.n_threads = threads;
-    ctx_params.n_threads_batch = threads;
-    
-    // Apply flash attention context setting if enabled
-    if (g_flash_attn) {
-        // Flash attention context settings would go here if supported
-        LOGI("Flash attention context setting applied");
+    void done(int n_tokens, long long elapsed_ms) const {
+        if (on_done) env->CallVoidMethod(obj, on_done, (jint) n_tokens, (jlong) elapsed_ms);
     }
 
-    g_ctx = llama_init_from_model(g_model, ctx_params);
-    if (!g_ctx) {
-        LOGE("Failed to create context for model at %s", path);
-        llama_model_free(g_model);
-        g_model = NULL;
-        pthread_mutex_unlock(&g_lock);
-        env->ReleaseStringUTFChars(modelPath, path);
-        return env->NewStringUTF("Error: Failed to create model context. The model might be corrupted or incompatible with this version.");
+    void error(const std::string & msg) const {
+        if (!on_error) return;
+        LOGE("%s", msg.c_str());
+        jstring js = utf8_to_jstring(env, msg);
+        env->CallVoidMethod(obj, on_error, js);
+        env->DeleteLocalRef(js);
     }
+};
 
-    g_inference_active = 1;
-    pthread_mutex_unlock(&g_lock);
+// ---------------------------------------------------------------------------
+// Sampler
+// ---------------------------------------------------------------------------
 
-    LOGI("Model loaded successfully from %s", path);
-    env->ReleaseStringUTFChars(modelPath, path);
-    return env->NewStringUTF("Success");
-}
-
-// --- Java Native Interface: Check if Model is Loaded ---
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_org_zzssg_llmchatapp_LlamaWrapper_nativeIsModelLoaded(JNIEnv *env, jclass thiz) {
-    pthread_mutex_lock(&g_lock);
-    jboolean result = (g_model != NULL && g_ctx != NULL) ? JNI_TRUE : JNI_FALSE;
-    pthread_mutex_unlock(&g_lock);
-    return result;
-}
-
-// --- Java Native Interface: Generate (async) ---
-extern "C"
-JNIEXPORT void JNICALL
-Java_org_zzssg_llmchatapp_LlamaWrapper_nativeGenerate(JNIEnv *env, jclass thiz, jstring prompt, jint maxTokens, jobject callbackObj) {
-    if (!prompt || !callbackObj) {
-        LOGE("Invalid parameters: prompt or callback object is null");
-        return;
-    }
-
-    pthread_mutex_lock(&g_lock);
-    if (!g_ctx || !g_model) {
-        LOGE("Model not loaded! Cannot generate response.");
-        pthread_mutex_unlock(&g_lock);
-        
-        // Get method ID for error callback
-        jclass callbackClass = env->GetObjectClass(callbackObj);
-        jmethodID onErrorMethodId = env->GetMethodID(callbackClass, "onError", "(Ljava/lang/String;)V");
-        
-        if (onErrorMethodId) {
-            env->CallVoidMethod(callbackObj,
-                               onErrorMethodId,
-                               env->NewStringUTF("Error: Model not initialized. Please load a valid GGUF model file first."));
-        }
-        return;
-    }
-    pthread_mutex_unlock(&g_lock);
-
-    // Prepare data for thread
-    inference_context_t* ctx_data = (inference_context_t*) malloc(sizeof(inference_context_t));
-    if (!ctx_data) {
-        LOGE("Failed to allocate context for inference");
-        
-        // Get method ID for error callback
-        jclass callbackClass = env->GetObjectClass(callbackObj);
-        jmethodID onErrorMethodId = env->GetMethodID(callbackClass, "onError", "(Ljava/lang/String;)V");
-        
-        if (onErrorMethodId) {
-            env->CallVoidMethod(callbackObj,
-                               onErrorMethodId,
-                               env->NewStringUTF("Error: Memory allocation failed. Not enough memory for inference."));
-        }
-        return;
-    }
-
-    // Get method IDs
-    jclass callbackClass = env->GetObjectClass(callbackObj);
-    jmethodID onResultMethodId = env->GetMethodID(callbackClass, "onResult", "(Ljava/lang/String;)V");
-    jmethodID onErrorMethodId = env->GetMethodID(callbackClass, "onError", "(Ljava/lang/String;)V");
-    jmethodID onProgressMethodId = env->GetMethodID(callbackClass, "onProgress", "(Ljava/lang/String;)V");
-
-    ctx_data->env = env;
-    ctx_data->callback = env->NewGlobalRef(callbackObj);
-    ctx_data->onResultMethodId = onResultMethodId;
-    ctx_data->onErrorMethodId = onErrorMethodId;
-    ctx_data->onProgressMethodId = onProgressMethodId;
-    
-    // Copy prompt safely
-    const char* promptChars = jstringToUtf8(env, prompt);
-    //const char* promptChars = env->GetStringUTFChars(prompt, 0);
-    if (!promptChars) {
-        LOGE("Failed to convert prompt to UTF-8");
-        env->DeleteGlobalRef(ctx_data->callback);
-        free(ctx_data);
-        return;
-    }
-
-    LOGI("Prompt (utf8) = '%s'", promptChars);
-
-    // Ensure prompt fits into ctx_data->prompt
-    size_t prompt_len = strlen(promptChars);
-    if (prompt_len >= sizeof(ctx_data->prompt)) {
-        LOGE("Prompt too long (%zu bytes), truncating to %zu", prompt_len, sizeof(ctx_data->prompt)-1);
-        // truncate safely
-        strncpy(ctx_data->prompt, promptChars, sizeof(ctx_data->prompt) - 1);
-        ctx_data->prompt[sizeof(ctx_data->prompt) - 1] = '\0';
-    } else {
-        strcpy(ctx_data->prompt, promptChars);
-    }
-    
-    ctx_data->max_tokens = maxTokens;
-
-    // Start inference thread
-    pthread_t tid;
-    int rc = pthread_create(&tid, NULL, inference_thread, (void*)ctx_data);
-    if (rc != 0) {
-        LOGE("Failed to create inference thread, error code: %d", rc);
-        env->DeleteGlobalRef(ctx_data->callback);
-        free(ctx_data);
-        
-        // Call error callback
-        if (onErrorMethodId) {
-            env->CallVoidMethod(callbackObj, onErrorMethodId,
-                               env->NewStringUTF("Error: Failed to create inference thread. System resources might be exhausted."));
-        }
-        return;
-    }
-
-    pthread_detach(tid); // Let it clean up on its own
-}
-
-// --- Java Native Interface: Free Resources ---
-extern "C"
-JNIEXPORT void JNICALL
-Java_org_zzssg_llmchatapp_LlamaWrapper_nativeFree(JNIEnv *env, jclass thiz) {
-    pthread_mutex_lock(&g_lock);
-    if (g_ctx) {
-        llama_free(g_ctx);
-        g_ctx = NULL;
-    }
-    if (g_model) {
-        llama_model_free(g_model);
-        g_model = NULL;
-    }
-    
-    // Free sampler resources
+// Order matters: penalties operate on the full distribution, then the truncation
+// samplers narrow the candidate set, then temperature reshapes it, then `dist`
+// draws. The previous build applied penalties *after* top-p/min-p had already
+// discarded most candidates, which made the penalty close to a no-op.
+void rebuild_sampler_locked() {
     if (g_sampler) {
         llama_sampler_free(g_sampler);
-        g_sampler = NULL;
-        g_sampler_initialized = false;
-    }
-    
-    g_inference_active = 0;
-    pthread_mutex_unlock(&g_lock);
-
-    // Free preferred devices list if allocated
-    if (g_preferred_devices) {
-        free(g_preferred_devices);
-        g_preferred_devices = NULL;
+        g_sampler = nullptr;
     }
 
-    // Free ggml/llama backends if needed
-    llama_backend_free();
+    auto chain_params = llama_sampler_chain_default_params();
+    chain_params.no_perf = true;
+    g_sampler = llama_sampler_chain_init(chain_params);
+    if (!g_sampler) return;
 
-    LOGI("LLM resources freed");
+    // llama_sampler_init_penalties gained a leading n_vocab parameter; the
+    // sampler is only ever rebuilt while a model is resident, so the vocab is
+    // always available here.
+    const int32_t n_vocab = g_model ? llama_vocab_n_tokens(llama_model_get_vocab(g_model)) : 0;
+
+    if (g_sparams.repeat_penalty != 1.0f && n_vocab > 0) {
+        llama_sampler_chain_add(g_sampler, llama_sampler_init_penalties(
+            n_vocab, g_sparams.repeat_last_n, g_sparams.repeat_penalty, 0.0f, 0.0f));
+    }
+
+    if (g_sparams.temp <= 0.0f) {
+        // Temperature 0 means deterministic decoding. A dist sampler over a
+        // one-hot distribution would still consume the RNG, so use greedy.
+        llama_sampler_chain_add(g_sampler, llama_sampler_init_greedy());
+        return;
+    }
+
+    if (g_sparams.top_k > 0)    llama_sampler_chain_add(g_sampler, llama_sampler_init_top_k(g_sparams.top_k));
+    if (g_sparams.top_p < 1.0f) llama_sampler_chain_add(g_sampler, llama_sampler_init_top_p(g_sparams.top_p, 1));
+    if (g_sparams.min_p > 0.0f) llama_sampler_chain_add(g_sampler, llama_sampler_init_min_p(g_sparams.min_p, 1));
+    llama_sampler_chain_add(g_sampler, llama_sampler_init_temp(g_sparams.temp));
+    llama_sampler_chain_add(g_sampler, llama_sampler_init_dist(g_sparams.seed));
 }
 
-// --- Java Native Interface: Set JVM for threads ---
-extern "C"
+// ---------------------------------------------------------------------------
+// Decoding helpers
+// ---------------------------------------------------------------------------
+
+std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::string & text, bool add_special) {
+    const int32_t needed = -llama_tokenize(vocab, text.data(), (int32_t) text.size(),
+                                           nullptr, 0, add_special, true);
+    if (needed <= 0) return {};
+
+    std::vector<llama_token> tokens((size_t) needed);
+    const int32_t n = llama_tokenize(vocab, text.data(), (int32_t) text.size(),
+                                     tokens.data(), needed, add_special, true);
+    if (n < 0) return {};
+    tokens.resize((size_t) n);
+    return tokens;
+}
+
+std::string token_to_piece(const llama_vocab * vocab, llama_token id) {
+    char buf[256];
+    int32_t n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
+    if (n >= 0) return std::string(buf, (size_t) n);
+
+    // A negative return means "buffer too small, needed -n bytes".
+    std::string out((size_t) -n, '\0');
+    n = llama_token_to_piece(vocab, id, &out[0], (int32_t) out.size(), 0, true);
+    if (n < 0) return {};
+    out.resize((size_t) n);
+    return out;
+}
+
+// Feed `tokens` starting at position `pos0`, split into n_batch-sized chunks.
+// llama_decode rejects any batch larger than the context's logical batch size,
+// which is what made long prompts fail with "Failed to process prompt".
+bool decode_tokens(const std::vector<llama_token> & tokens, int pos0, bool logits_on_last) {
+    const int total = (int) tokens.size();
+    if (total == 0) return true;
+
+    const int n_batch = std::max(1, (int) llama_n_batch(g_ctx));
+
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    bool ok = true;
+
+    for (int off = 0; off < total && ok; off += n_batch) {
+        const int n = std::min(n_batch, total - off);
+        batch.n_tokens = n;
+        for (int i = 0; i < n; ++i) {
+            batch.token[i]     = tokens[(size_t) (off + i)];
+            batch.pos[i]       = pos0 + off + i;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i]    = false;
+        }
+        if (logits_on_last && off + n == total) {
+            batch.logits[n - 1] = true;
+        }
+        if (llama_decode(g_ctx, batch) != 0) {
+            ok = false;
+        }
+    }
+
+    llama_batch_free(batch);
+    return ok;
+}
+
+
+
+constexpr const char * THINK_OPEN_TAG  = "<think>";
+constexpr const char * THINK_SUFFIX_ON  = "<think>\n";
+constexpr const char * THINK_SUFFIX_OFF = "<think>\n\n</think>\n\n";
+
+// Whether the loaded model is a reasoning model.
+//
+// Detected from its chat template rather than from the architecture name, which
+// says nothing about it: Qwen3, DeepSeek-R1 and others all mark reasoning with a
+// <think> block, and a template that never mentions one belongs to a model that
+// does not reason.
+bool model_uses_think_blocks_locked() {
+    if (!g_model) return false;
+    const char * tmpl = llama_model_chat_template(g_model, nullptr);
+    return tmpl && strstr(tmpl, THINK_OPEN_TAG) != nullptr;
+}
+
+
+// Thinking mode, mirroring org.zzssg.llmchatapp.llm.ThinkingMode.
+enum thinking_mode { THINKING_AUTO = 0, THINKING_ON = 1, THINKING_OFF = 2 };
+
+// Reproduces what the model's own Jinja template does for enable_thinking.
+//
+// llama_chat_apply_template is the non-Jinja path: it matches a template to a
+// hardcoded C++ implementation and cannot evaluate a variable like
+// enable_thinking. The templates that support it all express the choice the same
+// way -- open a <think> block for the model to fill, or pre-fill an empty one so
+// it skips straight to the answer -- so appending the suffix ourselves gives the
+// same prompt the Jinja path would have produced.
+std::string apply_thinking_suffix(const std::string & prompt, int mode) {
+    if (mode == THINKING_AUTO) return prompt;
+    if (!model_uses_think_blocks_locked()) return prompt;
+
+    // Some templates already emit the opener. Do not add a second one.
+    const size_t tail = prompt.size() < 32 ? 0 : prompt.size() - 32;
+    if (prompt.find(THINK_OPEN_TAG, tail) != std::string::npos) return prompt;
+
+    return prompt + (mode == THINKING_OFF ? THINK_SUFFIX_OFF : THINK_SUFFIX_ON);
+}
+
+// Reads general.architecture straight out of the GGUF header.
+//
+// llama.cpp rejects an unknown architecture with a runtime_error that it logs
+// and swallows, so all the JNI layer sees is a NULL model -- indistinguishable
+// from a corrupt file. Re-reading the header lets us tell the user which of the
+// two actually happened, and name the architecture when it is the culprit.
+std::string read_gguf_architecture(const char * path) {
+    gguf_init_params params = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+    gguf_context * ctx = gguf_init_from_file(path, params);
+    if (!ctx) return {};
+
+    std::string arch;
+    const int64_t key = gguf_find_key(ctx, "general.architecture");
+    if (key >= 0) {
+        const char * value = gguf_get_val_str(ctx, key);
+        if (value) arch = value;
+    }
+    gguf_free(ctx);
+    return arch;
+}
+
+
+// Number of cores in the fastest frequency tier.
+//
+// Inference threads run in lockstep and synchronise at every layer, so a thread
+// on a slow core stalls all the others. What matters is therefore how many
+// *equally fast* cores exist, not how many cores there are.
+//
+// Guessing that from the core count alone breaks on both ends: a 4+4 big.LITTLE
+// phone and an all-performance flagship both report 8, but want 4 and 8 threads
+// respectively. Linux exposes the real answer through cpufreq.
+int count_fastest_cores() {
+    const long online = sysconf(_SC_NPROCESSORS_ONLN);
+    const int  cpus   = (int) (online > 0 ? online : 1);
+
+    std::vector<long> max_freq;
+    max_freq.reserve((size_t) cpus);
+
+    for (int i = 0; i < cpus; ++i) {
+        char path[128];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+        FILE * f = fopen(path, "r");
+        if (!f) continue;
+        long khz = 0;
+        if (fscanf(f, "%ld", &khz) == 1 && khz > 0) max_freq.push_back(khz);
+        fclose(f);
+    }
+
+    if (max_freq.empty()) {
+        // No cpufreq (some emulators, restricted sandboxes). Fall back to the
+        // conservative big.LITTLE assumption.
+        return std::max(1, cpus > 4 ? cpus / 2 : cpus);
+    }
+
+    const long fastest = *std::max_element(max_freq.begin(), max_freq.end());
+    // Within 15% counts as the same tier: prime and performance cores in one
+    // cluster differ slightly in clock but are equally useful here.
+    const long threshold = fastest - fastest / 7;
+
+    int n = 0;
+    for (long khz : max_freq) {
+        if (khz >= threshold) ++n;
+    }
+
+    return std::clamp(n, 1, cpus);
+}
+
+void ggml_log_to_logcat(ggml_log_level level, const char * text, void *) {
+    if (level == GGML_LOG_LEVEL_ERROR) {
+        LOGE("%s", text);
+        if (text) {
+            std::lock_guard<std::mutex> guard(g_log_lock);
+            if (g_log_errors.size() < MAX_LOG_CAPTURE) g_log_errors += text;
+        }
+    } else if (level == GGML_LOG_LEVEL_WARN) {
+        LOGW("%s", text);
+    }
+}
+
+std::string take_log_errors() {
+    std::lock_guard<std::mutex> guard(g_log_lock);
+    std::string out;
+    out.swap(g_log_errors);
+    return out;
+}
+
+} // namespace
+
+// ===========================================================================
+// JNI entry points
+// ===========================================================================
+
+extern "C" {
+
+JNIEXPORT jstring JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
+        JNIEnv * env, jclass, jstring jpath, jint threads, jint ctxSize, jint gpuLayers) {
+
+    const std::string path = jstring_to_utf8(env, jpath);
+
+    std::lock_guard<std::mutex> guard(g_lock);
+
+    // Loading a second model used to overwrite the globals and leak the first.
+    if (g_sampler) { llama_sampler_free(g_sampler); g_sampler = nullptr; }
+    if (g_ctx)     { llama_free(g_ctx);             g_ctx     = nullptr; }
+    if (g_model)   { llama_model_free(g_model);     g_model   = nullptr; }
+    g_model_loaded.store(false);
+    g_cached_tokens.clear();
+
+    llama_backend_init();
+    llama_log_set(ggml_log_to_logcat, nullptr);
+
+    int n_threads = threads;
+    if (n_threads <= 0) {
+        n_threads = count_fastest_cores();
+        LOGI("auto thread count: %d", n_threads);
+    }
+
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = gpuLayers;
+    // The separate use_mmap/use_mlock booleans were replaced by a single mode.
+    // MMAP without MLOCK is deliberate: pinning a multi-gigabyte model gets the
+    // app killed by Android's low-memory killer on most phones.
+    mparams.load_mode    = LLAMA_LOAD_MODE_MMAP;
+    // MTP layers (blk.N.nextn.*) only serve speculative decoding, which this
+    // app does not do. Skipping them saves memory on models that ship one.
+    mparams.load_mtp     = false;
+
+    LOGI("loading model: %s (threads=%d ctx=%d gpu_layers=%d)",
+         path.c_str(), n_threads, (int) ctxSize, (int) gpuLayers);
+
+    take_log_errors(); // discard anything from a previous attempt
+    g_model = llama_model_load_from_file(path.c_str(), mparams);
+    if (!g_model) {
+        const std::string reason = take_log_errors();
+
+        // llama.cpp names the architecture it does not recognise. Trust that
+        // over re-reading the header, which cannot tell a supported
+        // architecture from an unsupported one.
+        if (reason.find("unknown model architecture") != std::string::npos) {
+            std::string arch = read_gguf_architecture(path.c_str());
+            if (arch.empty()) arch = "unknown";
+            LOGE("unsupported architecture '%s'", arch.c_str());
+            return utf8_to_jstring(env,
+                "E_ARCH|This model uses the \"" + arch + "\" architecture, which the bundled "
+                "inference engine does not support. Try a model built on a more established "
+                "architecture, such as qwen3, llama or gemma3.");
+        }
+
+        if (reason.find("not within the file bounds") != std::string::npos ||
+            reason.find("corrupted or incomplete") != std::string::npos) {
+            return utf8_to_jstring(env,
+                "E_TRUNCATED|This model file is incomplete. The download probably did not "
+                "finish -- check the file size against the source and download it again.");
+        }
+
+        if (read_gguf_architecture(path.c_str()).empty()) {
+            return utf8_to_jstring(env,
+                "E_LOAD|This file is not a readable GGUF model.");
+        }
+
+        return utf8_to_jstring(env,
+            "E_LOAD|The model could not be loaded." + (reason.empty() ? "" : " " + reason));
+    }
+
+    const int n_ctx_train = llama_model_n_ctx_train(g_model);
+    int n_ctx = ctxSize > 0 ? (int) ctxSize : 4096;
+    if (n_ctx_train > 0 && n_ctx > n_ctx_train) {
+        LOGW("requested ctx %d exceeds the model's training ctx %d, clamping", n_ctx, n_ctx_train);
+        n_ctx = n_ctx_train;
+    }
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx           = (uint32_t) n_ctx;
+    cparams.n_batch         = (uint32_t) std::min(n_ctx, 512);
+    cparams.n_ubatch        = (uint32_t) std::min(n_ctx, 256);
+    cparams.n_threads       = n_threads;
+    cparams.n_threads_batch = n_threads;
+    cparams.no_perf         = true;
+    // AUTO lets llama.cpp enable flash attention only when the loaded model and
+    // backend actually support it. The old code logged the flag and did nothing.
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+
+    g_ctx = llama_init_from_model(g_model, cparams);
+    if (!g_ctx) {
+        llama_model_free(g_model);
+        g_model = nullptr;
+        return utf8_to_jstring(env,
+            "E_CONTEXT|Not enough memory to open this model. Try a smaller model or a shorter context.");
+    }
+
+    rebuild_sampler_locked();
+    if (!g_sampler) {
+        llama_free(g_ctx);         g_ctx   = nullptr;
+        llama_model_free(g_model); g_model = nullptr;
+        return utf8_to_jstring(env, "E_SAMPLER|Could not initialise the sampler.");
+    }
+
+    g_model_loaded.store(true);
+    LOGI("model loaded: n_ctx=%d n_ctx_train=%d", n_ctx, n_ctx_train);
+    return utf8_to_jstring(env, "OK");
+}
+
+JNIEXPORT void JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeUnloadModel(JNIEnv *, jclass) {
+    // Ask any in-flight generation to stop before we block on its lock.
+    g_stop_requested.store(true);
+    std::lock_guard<std::mutex> guard(g_lock);
+
+    g_model_loaded.store(false);
+    if (g_sampler) { llama_sampler_free(g_sampler); g_sampler = nullptr; }
+    if (g_ctx)     { llama_free(g_ctx);             g_ctx     = nullptr; }
+    if (g_model)   { llama_model_free(g_model);     g_model   = nullptr; }
+    g_cached_tokens.clear();
+    g_stop_requested.store(false);
+    LOGI("model unloaded");
+}
+
+// Lock-free on purpose: this is polled from the UI thread. The old version took
+// the same mutex that inference holds for minutes, which froze the app.
+JNIEXPORT jboolean JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeIsModelLoaded(JNIEnv *, jclass) {
+    return g_model_loaded.load() ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jint JNICALL
-JNI_OnLoad(JavaVM* vm, void* reserved) {
-    g_jvm = vm;
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeContextSize(JNIEnv *, jclass) {
+    if (!g_model_loaded.load()) return 0;
+    std::lock_guard<std::mutex> guard(g_lock);
+    return g_ctx ? (jint) llama_n_ctx(g_ctx) : 0;
+}
+
+JNIEXPORT jstring JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeModelDescription(JNIEnv * env, jclass) {
+    if (!g_model_loaded.load()) return utf8_to_jstring(env, "", 0);
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (!g_model) return utf8_to_jstring(env, "", 0);
+
+    char buf[256] = {0};
+    llama_model_desc(g_model, buf, sizeof(buf));
+    return utf8_to_jstring(env, buf, strnlen(buf, sizeof(buf)));
+}
+
+JNIEXPORT void JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeSetSampling(
+        JNIEnv *, jclass, jfloat temp, jfloat topP, jint topK, jfloat minP,
+        jfloat repeatPenalty, jint seed) {
+
+    std::lock_guard<std::mutex> guard(g_lock);
+    g_sparams.temp           = temp;
+    g_sparams.top_p          = topP;
+    g_sparams.top_k          = topK;
+    g_sparams.min_p          = minP;
+    g_sparams.repeat_penalty = repeatPenalty;
+    g_sparams.seed           = seed < 0 ? LLAMA_DEFAULT_SEED : (uint32_t) seed;
+    // Rebuild immediately so a settings change applies to the next turn. The old
+    // build created the sampler once and ignored every later parameter change.
+    if (g_ctx) rebuild_sampler_locked();
+}
+
+// Drops the KV cache so the next turn starts from an empty context.
+JNIEXPORT void JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeResetSession(JNIEnv *, jclass) {
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (g_ctx)     llama_memory_clear(llama_get_memory(g_ctx), true);
+    if (g_sampler) llama_sampler_reset(g_sampler);
+    g_cached_tokens.clear();
+}
+
+JNIEXPORT void JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeStop(JNIEnv *, jclass) {
+    g_stop_requested.store(true);
+}
+
+// Formats `roles`/`contents` with the model's own chat template and returns the
+// prompt string. Exposed separately so the UI can measure the prompt before
+// committing to a turn.
+
+JNIEXPORT jboolean JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeSupportsThinking(JNIEnv *, jclass) {
+    if (!g_model_loaded.load()) return JNI_FALSE;
+    std::lock_guard<std::mutex> guard(g_lock);
+    return model_uses_think_blocks_locked() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jstring JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeFormatPrompt(
+        JNIEnv * env, jclass, jobjectArray jroles, jobjectArray jcontents, jint thinkingMode) {
+
+    if (!g_model_loaded.load()) return utf8_to_jstring(env, "", 0);
+
+    const jsize n = env->GetArrayLength(jroles);
+    std::vector<std::string>        roles((size_t) n), contents((size_t) n);
+    std::vector<llama_chat_message> msgs((size_t) n);
+
+    for (jsize i = 0; i < n; ++i) {
+        jstring jr = (jstring) env->GetObjectArrayElement(jroles, i);
+        jstring jc = (jstring) env->GetObjectArrayElement(jcontents, i);
+        roles[(size_t) i]    = jstring_to_utf8(env, jr);
+        contents[(size_t) i] = jstring_to_utf8(env, jc);
+        if (jr) env->DeleteLocalRef(jr);
+        if (jc) env->DeleteLocalRef(jc);
+    }
+    // Fill the message array only after the strings are in their final storage,
+    // so c_str() cannot dangle from a vector reallocation.
+    for (jsize i = 0; i < n; ++i) {
+        msgs[(size_t) i].role    = roles[(size_t) i].c_str();
+        msgs[(size_t) i].content = contents[(size_t) i].c_str();
+    }
+
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (!g_model) return utf8_to_jstring(env, "", 0);
+
+    const char * tmpl = llama_model_chat_template(g_model, nullptr);
+
+    size_t cap = 1024;
+    for (jsize i = 0; i < n; ++i) cap += 2 * (roles[(size_t) i].size() + contents[(size_t) i].size());
+
+    std::string buf(cap, '\0');
+    int32_t len = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(), true,
+                                            &buf[0], (int32_t) buf.size());
+    if (len > (int32_t) buf.size()) {
+        buf.resize((size_t) len);
+        len = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(), true,
+                                        &buf[0], (int32_t) buf.size());
+    }
+
+    if (len < 0) {
+        // No usable template -- a base (non-instruct) model, or a Jinja template
+        // llama.cpp's non-Jinja parser does not recognise. Fall back to a plain
+        // transcript instead of failing the turn.
+        std::string fallback;
+        for (jsize i = 0; i < n; ++i) {
+            const std::string & role = roles[(size_t) i];
+            if      (role == "user")      fallback += "User: ";
+            else if (role == "assistant") fallback += "Assistant: ";
+            fallback += contents[(size_t) i];
+            fallback += "\n";
+        }
+        fallback += "Assistant:";
+        return utf8_to_jstring(env, apply_thinking_suffix(fallback, thinkingMode));
+    }
+
+    buf.resize((size_t) len);
+    return utf8_to_jstring(env, apply_thinking_suffix(buf, thinkingMode));
+}
+
+JNIEXPORT void JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
+        JNIEnv * env, jclass, jstring jprompt, jint maxTokens, jobject jcallback) {
+
+    java_callback cb;
+    if (!jcallback || !cb.bind(env, jcallback)) {
+        LOGE("callback object does not implement the expected interface");
+        return;
+    }
+
+    if (!g_model_loaded.load()) {
+        cb.error("E_NOT_LOADED|No model is loaded.");
+        return;
+    }
+
+    // Reject overlapping generations instead of silently queueing them on the
+    // mutex, which used to interleave positions and corrupt the KV cache.
+    bool expected = false;
+    if (!g_generating.compare_exchange_strong(expected, true)) {
+        cb.error("E_BUSY|A response is already being generated.");
+        return;
+    }
+
+    const std::string prompt = jstring_to_utf8(env, jprompt);
+    g_stop_requested.store(false);
+
+    std::lock_guard<std::mutex> guard(g_lock);
+
+    if (!g_ctx || !g_model || !g_sampler) {
+        g_generating.store(false);
+        cb.error("E_NOT_LOADED|No model is loaded.");
+        return;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(g_model);
+    const int           n_ctx = (int) llama_n_ctx(g_ctx);
+
+    std::vector<llama_token> tokens = tokenize(vocab, prompt, true);
+    if (tokens.empty()) {
+        g_generating.store(false);
+        cb.error("E_TOKENIZE|Could not tokenize the prompt.");
+        return;
+    }
+
+    // Leave room for the response. If the conversation no longer fits we drop
+    // the oldest tokens rather than failing; the UI warns about this separately.
+    const int n_prompt_budget = n_ctx - (int) maxTokens - 8;
+    if (n_prompt_budget <= 0) {
+        g_generating.store(false);
+        cb.error("E_CONTEXT_FULL|The context window is too small for this request.");
+        return;
+    }
+    if ((int) tokens.size() > n_prompt_budget) {
+        LOGW("prompt is %zu tokens, budget is %d -- truncating from the front",
+             tokens.size(), n_prompt_budget);
+        tokens.erase(tokens.begin(), tokens.end() - n_prompt_budget);
+    }
+
+    // Prefix reuse: keep whatever the KV cache already holds and decode only the
+    // divergent tail. Without this every turn reprocesses the whole transcript --
+    // and the old code never cleared the cache at all, so the second turn decoded
+    // fresh tokens onto positions that were already occupied, which is what
+    // produced garbled replies after the first message.
+    size_t common = 0;
+    while (common < g_cached_tokens.size() && common < tokens.size() &&
+           g_cached_tokens[common] == tokens[common]) {
+        ++common;
+    }
+    // Always re-decode at least the final token so we have fresh logits to sample.
+    if (common == tokens.size() && common > 0) --common;
+
+    llama_memory_t mem = llama_get_memory(g_ctx);
+
+    if (common > 0) {
+        // Partial eviction is not universally supported. Recurrent and hybrid
+        // models (Mamba, RWKV, Qwen3-Next/qwen35) carry a single rolling state
+        // rather than a per-position cache, so llama.cpp can only roll it back a
+        // few steps and returns false otherwise. Ignoring that return value left
+        // the cache inconsistent and made llama_decode fail -- which is why the
+        // *second* message of every conversation errored out on such models
+        // while the first one worked.
+        if (!llama_memory_seq_rm(mem, 0, (llama_pos) common, -1)) {
+            LOGI("partial cache eviction unsupported for this model, reprocessing from scratch");
+            common = 0;
+        }
+    }
+
+    if (common == 0) {
+        llama_memory_clear(mem, true);
+    }
+
+    const std::vector<llama_token> tail(tokens.begin() + (long) common, tokens.end());
+    const auto t_start = std::chrono::steady_clock::now();
+
+    if (!decode_tokens(tail, (int) common, /*logits_on_last=*/true)) {
+        llama_memory_clear(mem, true);
+        g_cached_tokens.clear();
+        g_generating.store(false);
+        cb.error("E_DECODE|Failed to process the prompt.");
+        return;
+    }
+
+    g_cached_tokens = tokens;
+
+    // Prime the repetition penalty with the prompt so it sees the recent context
+    // instead of starting from an empty window on every turn.
+    llama_sampler_reset(g_sampler);
+    for (llama_token t : tokens) {
+        llama_sampler_accept(g_sampler, t);
+    }
+
+    std::string pending;      // bytes held back as an incomplete UTF-8 sequence
+    int         n_generated = 0;
+    int         n_past      = (int) tokens.size();
+
+    while (n_generated < (int) maxTokens) {
+        if (g_stop_requested.load()) break;
+
+        const llama_token id = llama_sampler_sample(g_sampler, g_ctx, -1);
+        if (id < 0) {
+            LOGE("sampler returned an invalid token");
+            break;
+        }
+        llama_sampler_accept(g_sampler, id);
+
+        if (llama_vocab_is_eog(vocab, id)) break;
+
+        pending += token_to_piece(vocab, id);
+        const size_t safe = utf8_safe_len(pending);
+        if (safe > 0) {
+            cb.token(pending.substr(0, safe));
+            pending.erase(0, safe);
+        }
+
+        g_cached_tokens.push_back(id);
+        ++n_generated;
+
+        if (n_past >= n_ctx - 1) {
+            LOGW("context window exhausted after %d generated tokens", n_generated);
+            break;
+        }
+
+        const std::vector<llama_token> one{id};
+        if (!decode_tokens(one, n_past, /*logits_on_last=*/true)) {
+            LOGE("decode failed at position %d", n_past);
+            break;
+        }
+        ++n_past;
+    }
+
+    if (!pending.empty()) {
+        cb.token(pending); // flush the tail even if it is malformed
+    }
+
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_start).count();
+
+    LOGI("generated %d tokens in %lld ms (%.2f tok/s)", n_generated, (long long) elapsed,
+         elapsed > 0 ? n_generated * 1000.0 / (double) elapsed : 0.0);
+
+    g_stop_requested.store(false);
+    g_generating.store(false);
+    cb.done(n_generated, (long long) elapsed);
+}
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *, void *) {
     return JNI_VERSION_1_6;
 }
+
+} // extern "C"

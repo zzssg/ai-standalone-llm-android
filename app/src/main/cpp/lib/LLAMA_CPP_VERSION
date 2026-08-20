@@ -1,0 +1,48 @@
+llama.cpp
+=========
+
+Tracked as a git submodule at app/src/main/cpp/lib/llama.cpp. The pinned commit
+IS the provenance -- `git submodule status` is authoritative, this file only
+records what a bump involves.
+
+Currently pinned to tag b10488.
+
+Getting the source
+------------------
+
+    git clone --recurse-submodules <this repo>
+
+or, in an existing clone:
+
+    git submodule update --init
+
+Add --shallow-submodules to the clone if you do not need llama.cpp's history.
+
+Bumping the version
+-------------------
+
+    cd app/src/main/cpp/lib/llama.cpp
+    git fetch --tags origin
+    git checkout <new tag>
+    cd -
+    git add app/src/main/cpp/lib/llama.cpp
+
+Then, before committing:
+
+  1. Re-check llama_wrapper.cpp against include/llama.h. The C API changes
+     between releases, and the compiler only catches some of it. The b10488
+     bump needed three fixes:
+       - llama_sampler_init_penalties() gained a leading n_vocab parameter
+       - model_params.use_mmap / use_mlock became the load_mode enum
+       - LLAMA_CURL was deprecated in favour of LLAMA_BUILD_APP / _UI / _MTMD
+  2. Keep GGML_BACKEND_DL and GGML_CPU_ALL_VARIANTS OFF in ../CMakeLists.txt.
+     Turning them on yields an APK with no compute backend at all: the backends
+     become dlopen()ed modules searched for next to the executable, which on
+     Android is /system/bin/app_process64 and never the APK.
+  3. Delete llama.cpp/AGENTS.md and llama.cpp/CLAUDE.md. They are contributor
+     instructions for llama.cpp itself and get picked up by tooling working in
+     this repository. The submodule is configured with ignore = dirty so these
+     deletions do not show up as changes.
+  4. Run ./gradlew testDebugUnitTest connectedDebugAndroidTest. The instrumented
+     suite is what proves the bump did not regress multi-turn behaviour; push a
+     model to /data/local/tmp/test-model.gguf first.

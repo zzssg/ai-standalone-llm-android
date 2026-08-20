@@ -1,7 +1,0 @@
-C:/msys64/home/Sergei/ai-standalone-android/app/src/main/cpp/lib/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/build-host/CMakeFiles/vulkan-shaders-gen.dir
-C:/msys64/home/Sergei/ai-standalone-android/app/src/main/cpp/lib/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/build-host/CMakeFiles/edit_cache.dir
-C:/msys64/home/Sergei/ai-standalone-android/app/src/main/cpp/lib/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/build-host/CMakeFiles/rebuild_cache.dir
-C:/msys64/home/Sergei/ai-standalone-android/app/src/main/cpp/lib/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/build-host/CMakeFiles/list_install_components.dir
-C:/msys64/home/Sergei/ai-standalone-android/app/src/main/cpp/lib/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/build-host/CMakeFiles/install.dir
-C:/msys64/home/Sergei/ai-standalone-android/app/src/main/cpp/lib/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/build-host/CMakeFiles/install/local.dir
-C:/msys64/home/Sergei/ai-standalone-android/app/src/main/cpp/lib/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/build-host/CMakeFiles/install/strip.dir
