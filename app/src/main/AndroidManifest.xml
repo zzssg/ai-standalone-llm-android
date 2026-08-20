@@ -2,19 +2,33 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!--
-        No permissions are declared on purpose.
+        The permission list is deliberately as short as it can be.
 
         Models are picked through the Storage Access Framework, which grants
         per-document access without READ_EXTERNAL_STORAGE (the old manifest
         requested that permission but never used it, and on API 33+ it does
-        nothing anyway). There is no INTERNET permission either, which is the
-        strongest possible guarantee that conversations never leave the device.
+        nothing anyway). There is no INTERNET permission, which is the strongest
+        possible guarantee that conversations never leave the device.
+
+        The four that are declared all exist for one reason: finishing a reply
+        the user already asked for. Without a foreground service the process is
+        cached and frozen as soon as the app leaves the screen; without a wake
+        lock the CPU suspends when the screen goes off. Both stop generation
+        dead. See GenerationService.
 
         Backup is off because the app's data directory holds multi-gigabyte model
         files that must not be pushed into cloud backup. allowBackup covers
         every version; the two rule files simply make the intent explicit for
         API 26-31 (fullBackupContent) and API 31+ (dataExtractionRules).
     -->
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- API 33+. Only affects whether the ongoing notice is visible; the service
+         runs either way, but a silent one would be a service the user cannot
+         see or stop. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="false"
@@ -36,6 +50,20 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            specialUse rather than dataSync or shortService. This is not a
+            transfer, and it does not fit shortService's three-minute budget:
+            a long answer from a 4B model regularly runs past that.
+        -->
+        <service
+            android:name=".llm.GenerationService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="On-device language model inference: finishes generating a reply the user requested while the app is backgrounded or the screen is off." />
+        </service>
     </application>
 
 </manifest>

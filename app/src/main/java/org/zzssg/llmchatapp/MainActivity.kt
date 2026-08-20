@@ -1,8 +1,10 @@
 package org.zzssg.llmchatapp
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
@@ -73,6 +75,26 @@ private fun App(viewModel: ChatViewModel = viewModel()) {
         ActivityResultContracts.OpenDocument()
     ) { uri -> uri?.let(viewModel::importModel) }
 
+    // Asked for at the first reply rather than at launch: that is the moment the
+    // notification is about to mean something, and generation is not blocked on
+    // the answer -- the foreground service runs either way, the permission only
+    // decides whether its ongoing notice, and its Stop button, are visible.
+    val notificationPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
+    var askedForNotifications by rememberSaveable { mutableStateOf(false) }
+
+    val send: (String) -> Unit = { text ->
+        if (!askedForNotifications && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            askedForNotifications = true
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        viewModel.send(text)
+    }
+
     val openPicker = remember(picker) { { picker.launch(arrayOf("*/*")) } }
     val closeDrawer = remember(drawerState, scope) { { scope.launch { drawerState.close() } } }
 
@@ -116,7 +138,7 @@ private fun App(viewModel: ChatViewModel = viewModel()) {
         ) {
             ChatScreen(
                 state = state,
-                onSend = viewModel::send,
+                onSend = send,
                 onStop = viewModel::stopGeneration,
                 onRetry = viewModel::retryLast,
                 onDismissError = viewModel::dismissError,

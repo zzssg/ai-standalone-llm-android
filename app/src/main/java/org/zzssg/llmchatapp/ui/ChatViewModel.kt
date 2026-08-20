@@ -26,6 +26,7 @@ import org.zzssg.llmchatapp.data.MtpPolicy
 import org.zzssg.llmchatapp.data.SettingsStore
 import org.zzssg.llmchatapp.llm.ChatTurn
 import org.zzssg.llmchatapp.llm.GenerationEvent
+import org.zzssg.llmchatapp.llm.GenerationService
 import org.zzssg.llmchatapp.llm.LlamaEngine
 import org.zzssg.llmchatapp.llm.LlamaException
 import org.zzssg.llmchatapp.llm.LoadedModel
@@ -114,6 +115,30 @@ data class ChatUiState(
     val canToggleThinking: Boolean get() = activeModel?.supportsThinking == true
 }
 
+/**
+ * A reply in flight, held apart from the screen.
+ *
+ * [messages] is the authoritative transcript of [chatId] while the reply is
+ * being written. The screen mirrors it only while that chat is the one on
+ * display; browsing elsewhere leaves the reply to finish into this copy, which
+ * is what gets filed and what is shown again on return. Without it, tokens
+ * would be appended to whatever transcript happened to be visible.
+ */
+internal class LiveReply(val chatId: String, var messages: List<ChatMessage>) {
+
+    /** True when this reply's chat is the one being displayed. */
+    fun isOnScreen(activeChatId: String?): Boolean = activeChatId == chatId
+
+    fun apply(messageId: String, transform: (ChatMessage) -> ChatMessage) {
+        messages = messages.map { if (it.id == messageId) transform(it) else it }
+    }
+
+    /** Ends any bubble still marked as streaming, after a stop or a failure. */
+    fun settle() {
+        messages = messages.map { if (it.streaming) it.copy(streaming = false) else it }
+    }
+}
+
 /** An error phrased for a person, with an optional recovery action. */
 data class UserFacingError(
     val title: String,
@@ -142,6 +167,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private var generationJob: Job? = null
 
+    /** Non-null while an answer is being written; see [LiveReply]. */
+    private var liveReply: LiveReply? = null
+
     init {
         val settings = settingsStore.load()
         _state.update {
@@ -159,15 +187,29 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Opens a stored conversation, replacing whatever is on screen. */
+    /**
+     * Opens a stored conversation, replacing whatever is on screen.
+     *
+     * Browsing away from a chat that is still being answered no longer cancels
+     * the answer: the reply is bound to its own conversation, keeps arriving
+     * while the user reads something else, and is shown again in full on return.
+     */
     fun openChat(id: String) {
         if (_state.value.activeChatId == id) return
         viewModelScope.launch {
-            stopGeneration()
+            val live = liveReply
+            if (live != null && live.isOnScreen(id)) {
+                // The copy on disk is a turn behind; the in-flight one is current.
+                _state.update { it.copy(activeChatId = id, messages = live.messages, error = null) }
+                return@launch
+            }
+
             val stored = chatStore.load(id) ?: return@launch
-            // The KV cache holds the previous conversation; the new one has to be
-            // processed from scratch.
-            engine.resetSession()
+            // The KV cache holds the previous conversation. With nothing running
+            // it is cheapest to drop it now; while a reply is in flight the cache
+            // belongs to that reply, and the prefix check reprocesses from
+            // scratch on the next turn anyway.
+            if (live == null) engine.resetSession()
             _state.update { state ->
                 state.copy(
                     activeChatId = stored.id,
@@ -180,6 +222,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteChat(id: String) {
         viewModelScope.launch {
+            // A reply being written into a chat that no longer exists has nowhere
+            // to land, so this is one of the few places that really must cancel.
+            if (liveReply?.chatId == id) stopGeneration()
             chatStore.delete(id)
             if (_state.value.activeChatId == id) {
                 startNewChat()
@@ -190,44 +235,49 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Clears the screen for a fresh conversation. Nothing is written until it has content. */
     fun startNewChat() {
+        // Cleared here and not inside the coroutine: a message sent before the
+        // launch had its turn would otherwise be appended to the conversation
+        // the user just left, and then vanish when the clear finally landed.
+        _state.update { it.copy(activeChatId = null, messages = emptyList(), error = null) }
         viewModelScope.launch {
-            stopGeneration()
-            engine.resetSession()
-            _state.update { it.copy(activeChatId = null, messages = emptyList(), error = null) }
+            if (liveReply == null) engine.resetSession()
         }
     }
 
     /**
-     * Writes the current conversation to disk.
+     * Writes [transcript] to the conversation it belongs to.
+     *
+     * Takes the transcript as an argument rather than reading it off the screen:
+     * by the time a reply finishes the user may well be looking at a different
+     * chat, and the answer still has to be filed under the one it was asked in.
      *
      * Called once a turn completes rather than on every token: a chat is only
      * worth keeping when it has an answer in it, and rewriting the file per token
      * would be pointless I/O.
      */
-    private fun persistCurrentChat() {
-        val state = _state.value
-        val messages = state.messages.filter { it.text.isNotBlank() }
+    private fun persistChat(chatId: String, transcript: List<ChatMessage>) {
+        val messages = transcript.filter { it.text.isNotBlank() }
         if (messages.isEmpty()) return
 
         viewModelScope.launch {
             val now = System.currentTimeMillis()
-            val id = state.activeChatId ?: UUID.randomUUID().toString()
-            val existing = state.activeChatId?.let { chatStore.load(it) }
+            val existing = chatStore.load(chatId)
 
             chatStore.save(
                 StoredChat(
-                    id = id,
+                    id = chatId,
                     title = existing?.title?.takeIf { it.isNotBlank() }
                         ?: ChatStore.deriveTitle(messages.firstOrNull { it.isUser }?.text.orEmpty()),
                     createdAt = existing?.createdAt ?: now,
                     updatedAt = now,
-                    modelId = state.activeModel?.file?.nameWithoutExtension.orEmpty(),
+                    modelId = _state.value.activeModel?.file?.nameWithoutExtension.orEmpty(),
                     messages = messages.map { it.toStored() },
                 )
             )
-            _state.update { it.copy(activeChatId = id, chats = chatStore.list()) }
+            _state.update { it.copy(chats = chatStore.list()) }
         }
     }
+
 
     // -- Model library ------------------------------------------------------
 
@@ -376,9 +426,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val userMessage = ChatMessage(role = ChatTurn.ROLE_USER, text = prompt)
         val placeholder = ChatMessage(role = ChatTurn.ROLE_ASSISTANT, text = "", streaming = true)
 
+        // A reply belongs to the conversation it was asked in, not to whichever
+        // one happens to be on screen when a token arrives. Fixing the id here
+        // is what lets the user browse other chats while an answer is written.
+        val targetChatId = _state.value.activeChatId ?: UUID.randomUUID().toString()
+        val live = LiveReply(targetChatId, _state.value.messages + userMessage + placeholder)
+        liveReply = live
+
         _state.update {
             it.copy(
-                messages = it.messages + userMessage + placeholder,
+                activeChatId = targetChatId,
+                messages = live.messages,
                 isGenerating = true,
                 error = null,
             )
@@ -387,6 +445,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val turns = buildTurns()
         val config = _state.value.settings.sampling
 
+        // Started from the tap that asked for the reply, which is the only moment
+        // the app is guaranteed to be allowed to enter the foreground.
+        GenerationService.start(getApplication())
+
         generationJob = viewModelScope.launch {
             val builder = StringBuilder()
             try {
@@ -394,10 +456,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     when (event) {
                         is GenerationEvent.Token -> {
                             builder.append(event.text)
-                            updateMessage(placeholder.id) { it.copy(text = builder.toString()) }
+                            updateMessage(targetChatId, placeholder.id) {
+                                it.copy(text = builder.toString())
+                            }
                         }
 
-                        is GenerationEvent.Done -> updateMessage(placeholder.id) {
+                        is GenerationEvent.Done -> updateMessage(targetChatId, placeholder.id) {
                             it.copy(
                                 text = builder.toString(),
                                 streaming = false,
@@ -414,13 +478,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: CancellationException) {
                 // The user pressed Stop, or the ViewModel is going away. Not an
                 // error -- and it must be rethrown so the coroutine really ends.
-                updateMessage(placeholder.id) { it.copy(text = builder.toString(), streaming = false) }
+                updateMessage(targetChatId, placeholder.id) {
+                    it.copy(text = builder.toString(), streaming = false)
+                }
                 throw e
             } catch (e: Exception) {
                 // Keep whatever streamed in before the failure; discarding it
                 // loses work the user already watched appear.
-                updateMessage(placeholder.id) { it.copy(streaming = false) }
-                if (builder.isEmpty()) {
+                updateMessage(targetChatId, placeholder.id) { it.copy(streaming = false) }
+                if (builder.isEmpty() && _state.value.activeChatId == targetChatId) {
                     _state.update { s -> s.copy(messages = s.messages.filterNot { it.id == placeholder.id }) }
                 }
                 _state.update {
@@ -433,17 +499,22 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 }
             } finally {
+                GenerationService.stop(getApplication())
                 _state.update { it.copy(isGenerating = false) }
-                persistCurrentChat()
+                val transcript = live.messages
+                if (liveReply === live) liveReply = null
+                persistChat(targetChatId, transcript)
             }
         }
     }
 
     /** Stops the in-flight reply, keeping the partial text. */
     fun stopGeneration() {
+        GenerationService.stop(getApplication())
         engine.stop()
         generationJob?.cancel()
         generationJob = null
+        liveReply?.settle()
         _state.update { state ->
             state.copy(
                 isGenerating = false,
@@ -524,8 +595,21 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             .forEach { (role, text) -> add(ChatTurn(role, text)) }
     }
 
-    private fun updateMessage(id: String, transform: (ChatMessage) -> ChatMessage) {
+    /**
+     * Applies [transform] to a message, but only while its conversation is the
+     * one on screen. Tokens for a chat the user has navigated away from are
+     * still collected -- they go to disk when the reply finishes -- they simply
+     * must not be written into somebody else's transcript.
+     */
+    private fun updateMessage(
+        chatId: String,
+        id: String,
+        transform: (ChatMessage) -> ChatMessage,
+    ) {
+        val live = liveReply?.takeIf { it.chatId == chatId }
+        live?.apply(id, transform)
         _state.update { state ->
+            if (state.activeChatId != chatId) return@update state
             state.copy(messages = state.messages.map { if (it.id == id) transform(it) else it })
         }
     }
