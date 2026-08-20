@@ -109,6 +109,35 @@ class MtpSetupTest {
     }
 
     /**
+     * The same measurement at the context size the app actually ships with.
+     *
+     * Context size and MTP both cost memory, and they are not independent: the
+     * draft context carries its own caches sized to the same window. A figure
+     * taken at 512 tokens says nothing about whether 4096 fits on a phone.
+     *
+     * Each load is attempted separately and a failure is reported rather than
+     * thrown, because running out of memory *is* the result at that depth.
+     */
+    @Test
+    fun measuresMtpCostAtProductionContextSize(): Unit = runBlocking {
+        val model = File(MODEL_PATH)
+        assumeTrue("No model at $MODEL_PATH", model.isFile)
+        assumeTrue("Native library unavailable on this ABI", engine.isAvailable)
+
+        for (ctx in listOf(512, 2048, 4096)) {
+            for (draft in listOf(0, 1, 2, 4)) {
+                engine.unload()
+                val outcome = runCatching { engine.load(model, contextSize = ctx, mtpDraft = draft) }
+                val line = outcome.fold(
+                    onSuccess = { "inUse=${memoryInUseBytes() / 1024 / 1024} MB mtp=${it.mtpDraft}" },
+                    onFailure = { "FAILED: ${it.message}" },
+                )
+                Log.i(TAG, "ctx=$ctx draft=$draft $line")
+            }
+        }
+    }
+
+    /**
      * Native allocations are mostly outside the Java heap, so Runtime figures are
      * useless here. Debug.getNativeHeapAllocatedSize covers the malloc arena;
      * mmap'd weights do not show up, which is what we want -- the interesting
