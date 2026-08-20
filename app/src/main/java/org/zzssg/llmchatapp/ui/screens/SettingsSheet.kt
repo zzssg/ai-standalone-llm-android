@@ -45,6 +45,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -113,19 +114,26 @@ fun SettingsSheet(
                     maxLines = 6,
                 )
 
-                if (canToggleThinking) {
-                    Spacer(Modifier.height(Spacing.md))
-                    SettingLabel(
-                        title = "Reasoning",
-                        description = "Reasoning models can work through a problem before " +
-                            "answering. It costs time and tokens on every reply.",
-                    )
-                    Spacer(Modifier.height(Spacing.sm))
-                    ThinkingSelector(
-                        mode = draft.sampling.thinking,
-                        onChange = { draft = draft.withSampling { copy(thinking = it) } },
-                    )
-                }
+                Spacer(Modifier.height(Spacing.md))
+                SettingLabel(
+                    title = "Reasoning",
+                    // The setting is kept and greyed rather than hidden: it is a
+                    // preference about models in general, so a reasoning model
+                    // loaded later should find the choice where it was left.
+                    description = if (canToggleThinking) {
+                        "Reasoning models can work through a problem before answering. " +
+                            "It costs time and tokens on every reply."
+                    } else {
+                        "The model in use has no reasoning block in its chat template, " +
+                            "so this has no effect until a reasoning model is loaded."
+                    },
+                )
+                Spacer(Modifier.height(Spacing.sm))
+                ThinkingSelector(
+                    mode = draft.sampling.thinking,
+                    enabled = canToggleThinking,
+                    onChange = { draft = draft.withSampling { copy(thinking = it) } },
+                )
             }
 
             // -- Output shape -------------------------------------------------
@@ -289,18 +297,30 @@ private fun SettingsGroup(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ThinkingSelector(mode: ThinkingMode, onChange: (ThinkingMode) -> Unit) {
+private fun ThinkingSelector(
+    mode: ThinkingMode,
+    enabled: Boolean,
+    onChange: (ThinkingMode) -> Unit,
+) {
     val options = listOf(
         ThinkingMode.ON to "Always",
         ThinkingMode.AUTO to "Model default",
         ThinkingMode.OFF to "Never",
     )
 
-    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+    // Material greys only the selected item when a segmented row is disabled,
+    // which leaves the other two looking tappable. Fading the whole row is what
+    // actually reads as unavailable.
+    SingleChoiceSegmentedButtonRow(
+        Modifier
+            .fillMaxWidth()
+            .alpha(if (enabled) 1f else 0.5f)
+    ) {
         options.forEachIndexed { index, (value, label) ->
             SegmentedButton(
                 selected = mode == value,
                 onClick = { onChange(value) },
+                enabled = enabled,
                 shape = SegmentedButtonDefaults.itemShape(index, options.size),
                 icon = {
                     // Default icon slot draws a check; keep it for the selected

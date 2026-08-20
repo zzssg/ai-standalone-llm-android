@@ -1,5 +1,8 @@
 package org.zzssg.llmchatapp.ui.components
 
+import org.zzssg.llmchatapp.llm.THINK_CLOSE
+import org.zzssg.llmchatapp.llm.THINK_OPEN
+
 /**
  * The structures a chat reply is made of.
  *
@@ -23,20 +26,30 @@ sealed interface MarkdownBlock {
     data class Reasoning(val text: String, val complete: Boolean) : MarkdownBlock
 }
 
-const val THINK_OPEN = "<think>"
-const val THINK_CLOSE = "</think>"
-
 /**
  * Splits reasoning out of [text] before anything else is parsed.
  *
- * Handles the case that made the block look broken on screen: when thinking is
- * switched on, the *opening* tag is part of the prompt, not of the reply, so
- * generation starts already inside the block and the only tag that ever arrives
- * is the closing one. A parser that waits for `<think>` therefore renders the
- * whole scratchpad as the answer and leaves a stray `</think>` in the middle of
- * it. A closing tag with nothing opened means everything before it is reasoning.
+ * [startsInReasoning] is the caller saying "the prompt left a block open, so
+ * this reply begins inside it" -- see promptOpensReasoning. It is what makes the
+ * block form as the reply streams: without it the scratchpad is indistinguishable
+ * from an answer until the closing tag finally arrives, so the reader watches
+ * paragraphs of deliberation appear as if they were the reply, then jump into a
+ * collapsed box at the end.
+ *
+ * When the flag is not set, a closing tag with nothing opened still means
+ * everything before it was reasoning. That keeps replies stored before the flag
+ * existed rendering the way they always did.
  */
-fun splitReasoning(text: String): List<MarkdownBlock> {
+fun splitReasoning(text: String, startsInReasoning: Boolean = false): List<MarkdownBlock> {
+    if (startsInReasoning) {
+        val close = text.indexOf(THINK_CLOSE)
+        // No closing tag yet: everything written so far is still scratchpad.
+        if (close < 0) return listOf(MarkdownBlock.Reasoning(text.trim(), complete = false))
+
+        return reasoning(text.substring(0, close)) +
+            splitReasoning(text.substring(close + THINK_CLOSE.length))
+    }
+
     if (!text.contains(THINK_OPEN) && !text.contains(THINK_CLOSE)) return parseProse(text)
 
     val blocks = mutableListOf<MarkdownBlock>()
@@ -49,7 +62,7 @@ fun splitReasoning(text: String): List<MarkdownBlock> {
         // A closing tag reached before any opening one: the reply began inside
         // the block because the template pre-filled the opener.
         if (close >= 0 && (open < 0 || close < open)) {
-            blocks += MarkdownBlock.Reasoning(text.substring(index, close).trim(), complete = true)
+            blocks += reasoning(text.substring(index, close))
             index = close + THINK_CLOSE.length
             continue
         }
@@ -69,11 +82,23 @@ fun splitReasoning(text: String): List<MarkdownBlock> {
             break
         }
 
-        blocks += MarkdownBlock.Reasoning(text.substring(bodyStart, bodyEnd).trim(), complete = true)
+        blocks += reasoning(text.substring(bodyStart, bodyEnd))
         index = bodyEnd + THINK_CLOSE.length
     }
 
     return blocks
+}
+
+/**
+ * A finished reasoning block, or nothing at all when the model did not use it.
+ *
+ * With thinking on, a model that sees no need to deliberate closes the block
+ * immediately. Drawing an empty box that says so on every such reply is noise;
+ * the absence of a block already says the model answered directly.
+ */
+private fun reasoning(body: String): List<MarkdownBlock> {
+    val text = body.trim()
+    return if (text.isEmpty()) emptyList() else listOf(MarkdownBlock.Reasoning(text, complete = true))
 }
 
 private val HEADING = Regex("""^(#{1,6})\s+(.*)$""")
@@ -197,3 +222,41 @@ private fun splitRow(line: String): List<String> =
         .removeSuffix("|")
         .split('|')
         .map { it.trim() }
+
+/**
+ * [text] with its reasoning removed, for copying and for replaying history.
+ *
+ * A scratchpad is shown because it is interesting, not because it is part of the
+ * answer. Copying a reply should paste what the model said, and sending a turn
+ * back to the model should carry only its conclusion -- reasoning models are
+ * trained to see their own answers in the history, and their templates strip
+ * prior thinking, so returning it wastes context and degrades the next reply.
+ */
+fun answerOnly(text: String, startsInReasoning: Boolean = false): String {
+    val firstOpen = text.indexOf(THINK_OPEN)
+    val firstClose = text.indexOf(THINK_CLOSE)
+    val beginsInside = startsInReasoning || (firstClose >= 0 && (firstOpen < 0 || firstClose < firstOpen))
+
+    val body = when {
+        !beginsInside -> text
+        // Still mid-thought: there is no answer to take yet.
+        firstClose < 0 -> ""
+        else -> text.substring(firstClose + THINK_CLOSE.length)
+    }
+
+    val out = StringBuilder()
+    var index = 0
+    while (index < body.length) {
+        val open = body.indexOf(THINK_OPEN, index)
+        if (open < 0) {
+            out.append(body, index, body.length)
+            break
+        }
+        out.append(body, index, open)
+        val close = body.indexOf(THINK_CLOSE, open + THINK_OPEN.length)
+        // An unterminated block means the whole tail is reasoning.
+        if (close < 0) break
+        index = close + THINK_CLOSE.length
+    }
+    return out.toString().trim()
+}

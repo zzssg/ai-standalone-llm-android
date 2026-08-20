@@ -62,6 +62,39 @@ class MarkdownRenderTest {
         assertTrue("a bitmap should have been produced", file.length() > 0)
     }
 
+    /**
+     * The state the reasoning fix is about: thinking is on, the closing tag has
+     * not arrived, and everything written so far is scratchpad. Before the fix
+     * this drew as an ordinary answer for the whole time the model deliberated.
+     */
+    @Test
+    fun rendersAReplyStillInsideItsReasoningBlock() {
+        compose.setContent {
+            LlmChatTheme(dynamicColor = false) {
+                Surface {
+                    androidx.compose.foundation.layout.Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState())
+                            .padding(16.dp)
+                    ) {
+                        MarkdownText(text = MID_THOUGHT, startsInReasoning = true)
+                    }
+                }
+            }
+        }
+        compose.waitForIdle()
+
+        val bitmap = compose.onRoot().captureToImage().asAndroidBitmap()
+        val dir = InstrumentationRegistry.getInstrumentation()
+            .targetContext.getExternalFilesDir(null)
+        val file = File(dir, "markdown-thinking.png")
+        android.util.Log.i("MarkdownRenderTest", "wrote " + file.absolutePath)
+        file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+
+        assertTrue("a bitmap should have been produced", file.length() > 0)
+    }
+
     private companion object {
         /** Trimmed from a real reply, including the pre-filled closing think tag. */
         val SAMPLE = """
@@ -90,6 +123,13 @@ class MarkdownRenderTest {
             ```kotlin
             val total = jobs.sumOf { it.rate * it.hours }
             ```
+        """.trimIndent()
+
+        /** Mid-generation, with the opener still sitting in the prompt. */
+        val MID_THOUGHT = """
+            The user is asking about income problems. I should work out what kind they mean before answering: it could be hourly rates, salaries, or averages over a period.
+
+            Let me lay out the common shapes first, then pick an example that covers more than one of them.
         """.trimIndent()
     }
 }

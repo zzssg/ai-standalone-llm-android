@@ -72,6 +72,16 @@ class LlamaException(val code: String, message: String) : Exception(message)
 
 /** Emitted while a response streams in. */
 sealed interface GenerationEvent {
+    /**
+     * Sent once, before the first token, describing the shape of what follows.
+     *
+     * [insideReasoning] says the prompt handed the model an open `<think>` block,
+     * so the reply starts as scratchpad and the closing tag is the only one that
+     * will arrive. Only the prompt builder knows this, and the UI needs it from
+     * the very first token to show a reasoning block instead of an answer.
+     */
+    data class Started(val insideReasoning: Boolean) : GenerationEvent
+
     data class Token(val text: String) : GenerationEvent
     data class Done(
         val tokenCount: Int,
@@ -174,6 +184,8 @@ class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
             if (prompt.isEmpty()) {
                 throw LlamaException("E_PROMPT", "Could not build a prompt for this model.")
             }
+
+            trySend(GenerationEvent.Started(promptOpensReasoning(prompt)))
 
             val sink = object : TokenSink {
                 override fun onToken(text: String) {

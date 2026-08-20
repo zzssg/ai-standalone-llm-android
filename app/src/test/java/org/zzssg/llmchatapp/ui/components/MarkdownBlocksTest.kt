@@ -45,6 +45,110 @@ class MarkdownBlocksTest {
         assertEquals(listOf(MarkdownBlock.Paragraph("Just an answer.")), splitReasoning("Just an answer."))
     }
 
+    // -- reasoning while it streams -----------------------------------------
+
+    /**
+     * The UX complaint: with thinking on, the scratchpad was shown as an ordinary
+     * answer for the whole minute it took to write, and only became a reasoning
+     * block once the closing tag arrived. The prompt is what knows, so the caller
+     * passes the fact in.
+     */
+    @Test
+    fun `a reply known to start inside a block is reasoning from the first token`() {
+        val reasoning = splitReasoning("The user is asking", startsInReasoning = true)
+            .single() as MarkdownBlock.Reasoning
+
+        assertEquals("The user is asking", reasoning.text)
+        assertTrue("unfinished, so it must not offer a finished trace", !reasoning.complete)
+    }
+
+    @Test
+    fun `the block closes and the answer begins when the closing tag arrives`() {
+        val blocks = splitReasoning(
+            "Weighing the options.\n</think>\n\n## Answer\n\nBlue.",
+            startsInReasoning = true,
+        )
+
+        assertEquals(MarkdownBlock.Reasoning("Weighing the options.", complete = true), blocks[0])
+        assertEquals(MarkdownBlock.Heading(2, "Answer"), blocks[1])
+        assertEquals(MarkdownBlock.Paragraph("Blue."), blocks[2])
+    }
+
+    /** Nothing has arrived yet: the block exists, empty, so the label can say so. */
+    @Test
+    fun `an empty reply that starts inside a block is an empty reasoning block`() {
+        val reasoning = splitReasoning("", startsInReasoning = true)
+            .single() as MarkdownBlock.Reasoning
+
+        assertEquals("", reasoning.text)
+        assertTrue(!reasoning.complete)
+    }
+
+    /** Thinking off: the prompt closed the block, so none of the reply is reasoning. */
+    @Test
+    fun `without the flag a tagless reply is all answer`() {
+        assertEquals(
+            listOf(MarkdownBlock.Paragraph("Blue.")),
+            splitReasoning("Blue.", startsInReasoning = false),
+        )
+    }
+
+    /**
+     * With thinking on, a model that sees nothing to deliberate closes the block
+     * at once. An empty box announcing that on most replies is clutter.
+     */
+    @Test
+    fun `a block the model closed without using is dropped`() {
+        val blocks = splitReasoning("\n</think>\n\nBlue.", startsInReasoning = true)
+
+        assertEquals(listOf(MarkdownBlock.Paragraph("Blue.")), blocks)
+    }
+
+    @Test
+    fun `an empty block written out in full is dropped too`() {
+        assertEquals(
+            listOf(MarkdownBlock.Paragraph("Blue.")),
+            splitReasoning("<think></think>\n\nBlue."),
+        )
+    }
+
+    // -- answerOnly ---------------------------------------------------------
+
+    @Test
+    fun `answerOnly drops a block whose opener was in the prompt`() {
+        val text = "Deliberating at length.\n</think>\n\nThe answer is blue."
+
+        assertEquals("The answer is blue.", answerOnly(text, startsInReasoning = true))
+        // The same without the flag: a closing tag with no opener is enough on
+        // its own, which is what keeps replies stored earlier copying correctly.
+        assertEquals("The answer is blue.", answerOnly(text))
+    }
+
+    @Test
+    fun `answerOnly drops an ordinary closed block`() {
+        assertEquals("Blue.", answerOnly("<think>weighing</think>\n\nBlue."))
+    }
+
+    /** Copying mid-thought should paste nothing rather than the scratchpad. */
+    @Test
+    fun `answerOnly is empty while only reasoning has been written`() {
+        assertEquals("", answerOnly("still thinking about it", startsInReasoning = true))
+        assertEquals("", answerOnly("<think>still thinking about it"))
+    }
+
+    @Test
+    fun `answerOnly leaves a plain reply alone`() {
+        assertEquals("Just an answer.", answerOnly("Just an answer."))
+    }
+
+    /** Copy has to paste the markdown the reader saw, structure and all. */
+    @Test
+    fun `answerOnly keeps markdown structure intact`() {
+        val answer = "## Title\n\n| A | B |\n|---|---|\n| 1 | 2 |"
+
+        assertEquals(answer, answerOnly("reasoning\n</think>\n\n" + answer, true))
+    }
+
     // -- headings, rules ----------------------------------------------------
 
     @Test

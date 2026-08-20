@@ -31,8 +31,7 @@ import org.zzssg.llmchatapp.llm.LlamaEngine
 import org.zzssg.llmchatapp.llm.LlamaException
 import org.zzssg.llmchatapp.llm.LoadedModel
 import org.zzssg.llmchatapp.llm.ThinkingMode
-import org.zzssg.llmchatapp.ui.components.THINK_CLOSE
-import org.zzssg.llmchatapp.ui.components.THINK_OPEN
+import org.zzssg.llmchatapp.ui.components.answerOnly
 import java.util.Locale
 import java.util.UUID
 
@@ -43,6 +42,12 @@ data class ChatMessage(
     val text: String,
     /** True while tokens are still arriving for this message. */
     val streaming: Boolean = false,
+    /**
+     * Set when the prompt handed the model an open `<think>` block, so this
+     * reply starts as reasoning. The renderer needs it from the first token;
+     * the text alone only reveals it once a closing tag arrives.
+     */
+    val startsInReasoning: Boolean = false,
     /** Set on the assistant message once generation ends. */
     val stats: GenerationStats? = null,
 ) {
@@ -454,6 +459,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 engine.generate(turns, config).collect { event ->
                     when (event) {
+                        // Arrives before the first token, which is what lets the
+                        // reasoning block form as the reply streams rather than
+                        // snapping into place at the closing tag.
+                        is GenerationEvent.Started -> updateMessage(targetChatId, placeholder.id) {
+                            it.copy(startsInReasoning = event.insideReasoning)
+                        }
+
                         is GenerationEvent.Token -> {
                             builder.append(event.text)
                             updateMessage(targetChatId, placeholder.id) {
@@ -590,7 +602,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             add(ChatTurn(ChatTurn.ROLE_SYSTEM, systemPrompt))
         }
         _state.value.messages
-            .map { it.role to if (it.isUser) it.text else it.text.withoutReasoning() }
+            // Reasoning is dropped from replayed turns: models are trained to see
+            // their own answers in the history, not their scratchpads, and their
+            // templates strip prior thinking. Returning it wastes context.
+            .map { it.role to if (it.isUser) it.text else answerOnly(it.text, it.startsInReasoning) }
             .filter { (_, text) -> text.isNotBlank() }
             .forEach { (role, text) -> add(ChatTurn(role, text)) }
     }
@@ -623,36 +638,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 }
 
-/**
- * Drops `<think>` blocks from an assistant turn before it is replayed.
- *
- * Reasoning models are trained to see only their own *answers* in the history,
- * not their scratchpads -- their own chat templates strip prior thinking. Sending
- * it back wastes context and degrades the next reply.
- */
-private fun String.withoutReasoning(): String {
-    if (!contains(THINK_OPEN)) return this
-
-    val out = StringBuilder()
-    var index = 0
-    while (index < length) {
-        val open = indexOf(THINK_OPEN, index)
-        if (open < 0) {
-            out.append(this, index, length)
-            break
-        }
-        out.append(this, index, open)
-        val close = indexOf(THINK_CLOSE, open + THINK_OPEN.length)
-        // An unterminated block means the whole tail is reasoning.
-        if (close < 0) break
-        index = close + THINK_CLOSE.length
-    }
-    return out.toString().trim()
-}
-
 private fun StoredMessage.toUiMessage() = ChatMessage(
     role = role,
     text = text,
+    startsInReasoning = startsInReasoning,
     stats = if (tokenCount > 0) {
         GenerationStats(tokenCount, elapsedMs, drafted, accepted)
     } else {
@@ -667,6 +656,7 @@ private fun ChatMessage.toStored() = StoredMessage(
     elapsedMs = stats?.elapsedMs ?: 0,
     drafted = stats?.drafted ?: 0,
     accepted = stats?.accepted ?: 0,
+    startsInReasoning = startsInReasoning,
 )
 
 private fun Throwable.readableMessage(): String = when (this) {

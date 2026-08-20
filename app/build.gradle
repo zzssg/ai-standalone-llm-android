@@ -31,8 +31,8 @@ android {
         // and llama.cpp's C++17 usage needs a modern libc++ anyway.
         minSdk 26
         targetSdk 36
-        versionCode 12
-        versionName "2.6.0"
+        versionCode 13
+        versionName "2.6.1"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 

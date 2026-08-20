@@ -20,6 +20,13 @@ data class StoredMessage(
     // defaults cover the other direction.
     val drafted: Int = 0,
     val accepted: Int = 0,
+    /**
+     * Whether the prompt left a reasoning block open, so the reply begins as
+     * scratchpad. Stored because it cannot be recovered from the text: a reply
+     * written that way carries a closing tag and no opener, and one stopped
+     * mid-thought carries no tag at all.
+     */
+    val startsInReasoning: Boolean = false,
 )
 
 /** A whole conversation as it sits on disk. */

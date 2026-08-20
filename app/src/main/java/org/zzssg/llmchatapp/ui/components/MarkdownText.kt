@@ -62,9 +62,10 @@ import org.zzssg.llmchatapp.ui.theme.Spacing
 fun MarkdownText(
     text: String,
     modifier: Modifier = Modifier,
+    startsInReasoning: Boolean = false,
     onCopyCode: (String) -> Unit = {},
 ) {
-    val blocks = remember(text) { splitReasoning(text) }
+    val blocks = remember(text, startsInReasoning) { splitReasoning(text, startsInReasoning) }
 
     Column(modifier, verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
         blocks.forEach { block ->
@@ -243,8 +244,12 @@ private fun CodeBlock(block: MarkdownBlock.Code, onCopy: (String) -> Unit) {
  */
 @Composable
 private fun ReasoningBlock(block: MarkdownBlock.Reasoning) {
-    var expanded by rememberSaveable(block.text) { mutableStateOf(false) }
-    val canExpand = block.complete
+    // Open while the model is still thinking, closed once it has answered:
+    // watching the reasoning arrive is the interesting part, re-reading it after
+    // the answer is there rarely is. Keyed on completeness rather than on the
+    // text so a collapse the reader chose survives the next token, and so the
+    // block folds itself away exactly once, when the answer starts.
+    var expanded by rememberSaveable(block.complete) { mutableStateOf(!block.complete) }
     val rotation by animateFloatAsState(if (expanded) 180f else 0f, label = "chevron")
 
     Surface(
@@ -255,15 +260,9 @@ private fun ReasoningBlock(block: MarkdownBlock.Reasoning) {
     ) {
         Column(
             Modifier
-                .then(
-                    if (canExpand) {
-                        Modifier.clickable(
-                            onClickLabel = if (expanded) "Hide reasoning" else "Show reasoning",
-                        ) { expanded = !expanded }
-                    } else {
-                        Modifier
-                    }
-                )
+                .clickable(
+                    onClickLabel = if (expanded) "Hide reasoning" else "Show reasoning",
+                ) { expanded = !expanded }
                 .padding(horizontal = Spacing.md, vertical = Spacing.sm)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -278,26 +277,25 @@ private fun ReasoningBlock(block: MarkdownBlock.Reasoning) {
                     style = MaterialTheme.typography.labelMedium,
                     modifier = Modifier.weight(1f),
                 )
-                if (canExpand) {
-                    Icon(
-                        imageVector = Icons.Outlined.ExpandMore,
-                        contentDescription = null,
-                        modifier = Modifier
-                            .size(18.dp)
-                            .rotate(rotation),
-                    )
-                }
+                Icon(
+                    imageVector = Icons.Outlined.ExpandMore,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .size(18.dp)
+                        .rotate(rotation),
+                )
             }
 
             if (expanded) {
                 Spacer(Modifier.size(Spacing.sm))
                 SelectionContainer {
                     Text(
-                        text = block.text.ifBlank {
-                            "This model reported no reasoning for this reply."
-                        },
+                        // Only reachable while streaming: a finished block with
+                        // nothing in it is dropped by the parser.
+                        text = block.text.ifBlank { "Working through the question..." },
                         style = MaterialTheme.typography.bodySmall,
                         fontStyle = if (block.text.isBlank()) FontStyle.Italic else null,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }

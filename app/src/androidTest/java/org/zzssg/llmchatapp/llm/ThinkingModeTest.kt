@@ -56,6 +56,60 @@ class ThinkingModeTest {
         assertTrue("qwen35 marks reasoning with <think>", loaded.supportsThinking)
     }
 
+    /**
+     * The signal the UI renders on. With thinking on the opener is in the prompt,
+     * so the reply arrives already inside the block and carries only the closing
+     * tag; with it off the prompt closes an empty block and nothing is reasoning.
+     * Getting this wrong is what made a minute of scratchpad read as the answer.
+     */
+    @Test
+    fun theStartEventReportsWhetherTheReplyBeginsInReasoning() = runBlocking {
+        val model = File(MODEL_PATH)
+        assumeTrue("No model at $MODEL_PATH", model.isFile)
+        assumeTrue("Native library unavailable on this ABI", engine.isAvailable)
+
+        val loaded = engine.load(model, contextSize = 1024)
+        assumeTrue("Model is not a reasoning model", loaded.supportsThinking)
+        engine.applySampling(base)
+
+        val on = engine.started(base.copy(thinking = ThinkingMode.ON))
+        val off = engine.started(base.copy(thinking = ThinkingMode.OFF))
+        Log.i(TAG, "started: on=$on off=$off")
+
+        assertTrue("thinking on leaves the block open for the model to fill", on)
+        assertFalse("thinking off pre-closes the block", off)
+    }
+
+    /** The reply the user sees, with the closing tag but no opener. */
+    @Test
+    fun aReplyWithThinkingOnCarriesOnlyTheClosingTag() = runBlocking {
+        val model = File(MODEL_PATH)
+        assumeTrue("No model at $MODEL_PATH", model.isFile)
+        assumeTrue("Native library unavailable on this ABI", engine.isAvailable)
+
+        val loaded = engine.load(model, contextSize = 1024)
+        assumeTrue("Model is not a reasoning model", loaded.supportsThinking)
+        engine.applySampling(base.copy(maxTokens = 160))
+
+        val text = engine.reply(base.copy(thinking = ThinkingMode.ON, maxTokens = 160))
+        Log.i(TAG, "ON -> <<<$text>>>")
+
+        assertFalse("the opener belongs to the prompt, not the reply", text.contains("<think>"))
+        // Whether the model finished thinking inside the budget is its own
+        // business; what matters is that no opener ever arrives, so the UI must
+        // be told rather than waiting for one.
+        assertTrue("reply should not be empty", text.isNotBlank())
+    }
+
+    private suspend fun LlamaEngine.started(config: SamplingConfig): Boolean =
+        generate(
+            listOf(
+                ChatTurn(ChatTurn.ROLE_SYSTEM, "You are a helpful assistant."),
+                ChatTurn(ChatTurn.ROLE_USER, "Name one colour."),
+            ),
+            config,
+        ).toList().filterIsInstance<GenerationEvent.Started>().single().insideReasoning
+
     private suspend fun LlamaEngine.reply(config: SamplingConfig): String =
         generate(
             listOf(
