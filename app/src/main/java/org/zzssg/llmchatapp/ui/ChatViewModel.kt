@@ -466,23 +466,29 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // -- Settings -----------------------------------------------------------
 
+    /**
+     * Applies settings and reopens the model.
+     *
+     * Every change reloads, not just the ones that strictly require it. Context
+     * size and thread count are baked into the llama_context, and speculative
+     * decoding decides how many contexts exist at all -- but sampling could in
+     * principle be applied live. Reloading uniformly is still the right call:
+     * partial application is what let the speculative-decoding setting look like
+     * it had taken effect while the engine carried on with the old one, and a
+     * settings screen that sometimes applies and sometimes does not is worse
+     * than one that always costs a few seconds.
+     */
     fun updateSettings(settings: AppSettings) {
-        val previous = _state.value.settings
         settingsStore.save(settings)
         _state.update { it.copy(settings = settings) }
 
         viewModelScope.launch {
             runCatching { engine.applySampling(settings.sampling) }
 
-            // Context size and thread count are baked into the llama_context, so
-            // they only take effect after a reload.
-            val needsReload = settings.contextSize != previous.contextSize ||
-                settings.threads != previous.threads
-            if (needsReload) {
-                _state.value.models
-                    .firstOrNull { it.id == _state.value.activeModel?.file?.name }
-                    ?.let { activate(it, LoadReason.SETTINGS_CHANGED) }
-            }
+            val active = _state.value.activeModel ?: return@launch
+            _state.value.models
+                .firstOrNull { it.id == active.file.name }
+                ?.let { activate(it, LoadReason.SETTINGS_CHANGED) }
         }
     }
 

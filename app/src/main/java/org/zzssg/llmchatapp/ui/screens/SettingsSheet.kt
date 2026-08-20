@@ -83,9 +83,9 @@ fun SettingsSheet(
     var draft by remember { mutableStateOf(settings) }
     var showAdvanced by remember { mutableStateOf(false) }
 
-    val needsReload = draft.contextSize != settings.contextSize ||
-        draft.threads != settings.threads ||
-        draft.mtp != settings.mtp
+    // Any change reopens the model, so the notice and the button follow whether
+    // anything changed at all rather than trying to guess which knobs are cheap.
+    val hasChanges = draft != settings
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
         Column(
@@ -229,7 +229,7 @@ fun SettingsSheet(
 
                 // Only shown once a reload is actually pending, so it reads as a
                 // consequence of what was just changed rather than a standing warning.
-                AnimatedVisibility(visible = needsReload) {
+                AnimatedVisibility(visible = hasChanges) {
                     ReloadNotice()
                 }
             }
@@ -247,11 +247,12 @@ fun SettingsSheet(
                         onApply(draft)
                         onDismiss()
                     },
+                    enabled = hasChanges,
                     modifier = Modifier
                         .weight(2f)
                         .heightIn(min = MinTouchTarget),
                     shape = RoundedCornerShape(14.dp),
-                ) { Text(if (needsReload) "Apply and reload" else "Apply") }
+                ) { Text(if (hasChanges) "Apply and reload" else "Apply") }
             }
         }
     }
