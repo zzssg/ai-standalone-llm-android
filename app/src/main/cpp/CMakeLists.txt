@@ -67,6 +67,12 @@ add_library(llama_wrapper SHARED llama_wrapper.cpp)
 target_include_directories(llama_wrapper PRIVATE
     ${LLAMA_CPP_DIR}/include
     ${LLAMA_CPP_DIR}/ggml/include
+    # Multi-token prediction lives in src/llama-ext.h, a staging header that
+    # upstream explicitly marks WIP ("breaking changes and C++ are allowed").
+    # Its symbols are exported from libllama.so, but the header is not published
+    # under include/, so the source tree has to be on the include path.
+    # Re-check this after every llama.cpp bump.
+    ${LLAMA_CPP_DIR}/src
 )
 
 target_link_libraries(llama_wrapper

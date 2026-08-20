@@ -50,6 +50,8 @@ external fun nativeLoadModel(
     threads: Int,
     ctxSize: Int,
     gpuLayers: Int,
+    /** Tokens to draft per step with the MTP head; 0 disables speculative decoding. */
+    mtpDraft: Int,
 ): String
 
 external fun nativeUnloadModel()
@@ -68,6 +70,9 @@ external fun nativeSetSampling(
     repeatPenalty: Float,
     seed: Int,
 )
+
+/** Draft depth actually in use, or 0 when MTP is unavailable or disabled. */
+external fun nativeMtpDraft(): Int
 
 /** True when the loaded model marks its reasoning with `<think>` blocks. */
 external fun nativeSupportsThinking(): Boolean

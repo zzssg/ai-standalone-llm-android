@@ -59,6 +59,8 @@ data class LoadedModel(
     val contextSize: Int,
     /** Whether a thinking toggle is meaningful for this model. */
     val supportsThinking: Boolean,
+    /** Draft depth in use for speculative decoding; 0 when not running. */
+    val mtpDraft: Int = 0,
 )
 
 /** A failure with a stable code, so the UI can react without matching on prose. */
@@ -94,13 +96,14 @@ class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
         threads: Int = 0,
         contextSize: Int = 4096,
         gpuLayers: Int = 0,
+        mtpDraft: Int = 0,
     ): LoadedModel = withContext(io) {
         requireAvailable()
         if (!file.isFile) {
             throw LlamaException("E_MISSING", "The model file is no longer on this device.")
         }
 
-        val result = nativeLoadModel(file.absolutePath, threads, contextSize, gpuLayers)
+        val result = nativeLoadModel(file.absolutePath, threads, contextSize, gpuLayers, mtpDraft)
         if (result != "OK") throw result.toLlamaException()
 
         LoadedModel(
@@ -108,6 +111,7 @@ class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
             description = nativeModelDescription(),
             contextSize = nativeContextSize(),
             supportsThinking = nativeSupportsThinking(),
+            mtpDraft = nativeMtpDraft(),
         )
     }
 

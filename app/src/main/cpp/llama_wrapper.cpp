@@ -22,6 +22,8 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "llama.h"
+// Staging API for multi-token prediction. See the note in CMakeLists.txt.
+#include "llama-ext.h"
 
 #define LOG_TAG "LlamaWrapper"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -42,6 +44,30 @@ std::mutex g_lock;
 llama_model   * g_model   = nullptr;
 llama_context * g_ctx     = nullptr;
 llama_sampler * g_sampler = nullptr;
+
+// Multi-token prediction.
+//
+// The model ships a small extra decoder block ("nextn"/MTP) trained to guess the
+// token after next. Running it is far cheaper than a full forward pass, so it can
+// draft several tokens which the main model then confirms in a single batch --
+// reading the multi-gigabyte weights once instead of once per token.
+//
+// That trade is exactly right here: generation on a phone is bound by memory
+// bandwidth, not by arithmetic, so the extra compute of a wider batch is close to
+// free while the saved weight reads are the whole cost.
+llama_context * g_ctx_mtp = nullptr;   // draft context, shares g_model
+int             g_mtp_draft = 0;       // tokens to draft per step; 0 disables MTP
+int             g_mtp_n_embd = 0;      // width of a hidden-state row
+
+// Hidden state carried between calls: the MTP head pairs the hidden state at
+// position p with the token at p+1, so the final row of one decode has to wait
+// for the next one to find its partner.
+std::vector<float> g_mtp_pending_h;
+
+// Hidden rows from the most recent target batch, used to re-seed g_mtp_pending_h
+// once we know how many drafted tokens were accepted.
+std::vector<float> g_mtp_verify_h;
+int                g_mtp_verify_rows = 0;
 
 // Read from the UI thread on every recomposition, so these must never block.
 std::atomic<bool> g_model_loaded{false};
@@ -447,6 +473,58 @@ int count_fastest_cores() {
     return std::clamp(n, 1, cpus);
 }
 
+
+// Brings up the draft context that runs the MTP head.
+//
+// It is a second context over the *same* model -- the weights are shared, only
+// the graph differs -- so the cost is the MTP block plus its own small state,
+// not another copy of the model.
+//
+// Failure here is not fatal: MTP is an optimisation, and a model without a
+// usable nextn block simply generates the ordinary way.
+void setup_mtp_locked(int draft, const llama_context_params & base) {
+    g_ctx_mtp = nullptr;
+    g_mtp_draft = 0;
+
+    const int n_layer_nextn = (int) llama_model_n_layer_nextn(g_model);
+    if (n_layer_nextn <= 0) {
+        LOGI("model has no MTP block, speculative decoding disabled");
+        return;
+    }
+
+    llama_context_params mparams = base;
+    mparams.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+    mparams.ctx_other = g_ctx;
+    // The draft head never needs to rewind: rejected drafts are dropped whole.
+    mparams.n_rs_seq  = 0;
+    mparams.embeddings = false;
+
+    g_ctx_mtp = llama_init_from_model(g_model, mparams);
+    if (!g_ctx_mtp) {
+        LOGW("could not create the MTP draft context, falling back to plain decoding");
+        return;
+    }
+
+    g_mtp_n_embd = (int) llama_model_n_embd_out(g_model);
+    if (g_mtp_n_embd <= 0) {
+        LOGW("MTP hidden width is %d, disabling", g_mtp_n_embd);
+        llama_free(g_ctx_mtp);
+        g_ctx_mtp = nullptr;
+        return;
+    }
+
+    // The target has to publish the hidden state that feeds the MTP head, and
+    // the draft context has to consume it.
+    llama_set_embeddings_nextn(g_ctx,     true, /*masked=*/ false);
+    llama_set_embeddings_nextn(g_ctx_mtp, true, /*masked=*/ true);
+
+    g_mtp_draft = draft;
+    g_mtp_pending_h.assign((size_t) g_mtp_n_embd, 0.0f);
+
+    LOGI("MTP enabled: draft=%d nextn_layers=%d n_embd=%d n_rs_seq=%d",
+         draft, n_layer_nextn, g_mtp_n_embd, (int) base.n_rs_seq);
+}
+
 void ggml_log_to_logcat(ggml_log_level level, const char * text, void *) {
     if (level == GGML_LOG_LEVEL_ERROR) {
         LOGE("%s", text);
@@ -476,7 +554,8 @@ extern "C" {
 
 JNIEXPORT jstring JNICALL
 Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
-        JNIEnv * env, jclass, jstring jpath, jint threads, jint ctxSize, jint gpuLayers) {
+        JNIEnv * env, jclass, jstring jpath, jint threads, jint ctxSize, jint gpuLayers,
+        jint mtpDraft) {
 
     const std::string path = jstring_to_utf8(env, jpath);
 
@@ -484,10 +563,15 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
 
     // Loading a second model used to overwrite the globals and leak the first.
     if (g_sampler) { llama_sampler_free(g_sampler); g_sampler = nullptr; }
+    if (g_ctx_mtp) { llama_free(g_ctx_mtp);         g_ctx_mtp = nullptr; }
     if (g_ctx)     { llama_free(g_ctx);             g_ctx     = nullptr; }
     if (g_model)   { llama_model_free(g_model);     g_model   = nullptr; }
     g_model_loaded.store(false);
     g_cached_tokens.clear();
+    g_mtp_draft = 0;
+    g_mtp_pending_h.clear();
+    g_mtp_verify_h.clear();
+    g_mtp_verify_rows = 0;
 
     llama_backend_init();
     llama_log_set(ggml_log_to_logcat, nullptr);
@@ -504,9 +588,8 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
     // MMAP without MLOCK is deliberate: pinning a multi-gigabyte model gets the
     // app killed by Android's low-memory killer on most phones.
     mparams.load_mode    = LLAMA_LOAD_MODE_MMAP;
-    // MTP layers (blk.N.nextn.*) only serve speculative decoding, which this
-    // app does not do. Skipping them saves memory on models that ship one.
-    mparams.load_mtp     = false;
+    // The MTP block is only worth its memory when we are going to draft with it.
+    mparams.load_mtp     = mtpDraft > 0;
 
     LOGI("loading model: %s (threads=%d ctx=%d gpu_layers=%d)",
          path.c_str(), n_threads, (int) ctxSize, (int) gpuLayers);
@@ -563,12 +646,24 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
     // backend actually support it. The old code logged the flag and did nothing.
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    // Rejecting a drafted token means rewinding the model's state by up to
+    // mtpDraft positions. Attention caches rewind for free, but a recurrent or
+    // hybrid model carries one rolling state and can only step back through
+    // snapshots it was told to keep. Each snapshot costs memory, which is why
+    // this is sized to the draft depth and left at zero when MTP is off.
+    const int mtp_requested = std::max(0, (int) mtpDraft);
+    cparams.n_rs_seq = (uint32_t) mtp_requested;
+
     g_ctx = llama_init_from_model(g_model, cparams);
     if (!g_ctx) {
         llama_model_free(g_model);
         g_model = nullptr;
         return utf8_to_jstring(env,
             "E_CONTEXT|Not enough memory to open this model. Try a smaller model or a shorter context.");
+    }
+
+    if (mtp_requested > 0) {
+        setup_mtp_locked(mtp_requested, cparams);
     }
 
     rebuild_sampler_locked();
@@ -657,6 +752,13 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeStop(JNIEnv *, jclass) {
 // Formats `roles`/`contents` with the model's own chat template and returns the
 // prompt string. Exposed separately so the UI can measure the prompt before
 // committing to a turn.
+
+JNIEXPORT jint JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeMtpDraft(JNIEnv *, jclass) {
+    if (!g_model_loaded.load()) return 0;
+    std::lock_guard<std::mutex> guard(g_lock);
+    return (jint) (g_ctx_mtp ? g_mtp_draft : 0);
+}
 
 JNIEXPORT jboolean JNICALL
 Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeSupportsThinking(JNIEnv *, jclass) {
