@@ -258,6 +258,21 @@ struct mtp_batch {
     }
 };
 
+
+// Puts the draft head back to a blank slate.
+//
+// It has to happen everywhere the target's memory is cleared. The two contexts
+// only produce useful drafts while they agree on what has been said, and leaving
+// the draft head holding a previous conversation makes its decode either fail
+// outright or return guesses about a history that no longer exists.
+void mtp_reset_locked() {
+    if (!g_ctx_mtp) return;
+    llama_memory_clear(llama_get_memory(g_ctx_mtp), true);
+    std::fill(g_mtp_pending_h.begin(), g_mtp_pending_h.end(), 0.0f);
+    g_mtp_verify_h.clear();
+    g_mtp_verify_rows = 0;
+}
+
 // Mirrors the target's decode into the draft head.
 //
 // The MTP head predicts the token after next, so it pairs the hidden state at
@@ -279,27 +294,37 @@ bool mtp_follow_target(const std::vector<llama_token> & tokens, int pos0) {
     const float * h_tgt = llama_get_embeddings_nextn(g_ctx);
     if (!h_tgt) { mb.free(); return false; }
 
+    // Copy the target's rows out before touching the draft context, so nothing
+    // depends on how long that pointer stays valid across another decode.
+    //
+    // h_nextn covers every position in the batch. The _ith accessor would index
+    // the output-ordered view instead, which only lines up when logits were
+    // requested on every row -- and the prompt is decoded with logits on its
+    // last token alone.
+    g_mtp_verify_rows = n;
+    g_mtp_verify_h.resize((size_t) n * n_embd);
+    std::memcpy(g_mtp_verify_h.data(), h_tgt, row_bytes * (size_t) n);
+
+    // The MTP head pairs the hidden state at position p with the token at p+1,
+    // so the rows shift right by one and the gap at the front is filled from the
+    // previous call.
     for (int32_t i = 0; i < n; ++i) {
-        const float * h = (i == 0) ? g_mtp_pending_h.data() : (h_tgt + (size_t) (i - 1) * n_embd);
+        const float * h = (i == 0)
+            ? g_mtp_pending_h.data()
+            : (g_mtp_verify_h.data() + (size_t) (i - 1) * n_embd);
         mb.add(tokens[(size_t) i], pos0 + i, h, n_embd, /*logits=*/ false);
     }
 
     const int rc = llama_decode(g_ctx_mtp, mb.batch);
     mb.free();
     if (rc != 0) {
+        g_mtp_verify_rows = 0;
         LOGW("MTP follow decode failed rc=%d", rc);
         return false;
     }
 
     // Keep the target's rows: which one becomes the next carryover depends on
     // how many drafted tokens survive verification, and that is not known yet.
-    g_mtp_verify_rows = n;
-    g_mtp_verify_h.resize((size_t) n * n_embd);
-    for (int32_t i = 0; i < n; ++i) {
-        const float * h = llama_get_embeddings_nextn_ith(g_ctx, i);
-        if (!h) { g_mtp_verify_rows = 0; return false; }
-        std::memcpy(g_mtp_verify_h.data() + (size_t) i * n_embd, h, row_bytes);
-    }
     std::memcpy(g_mtp_pending_h.data(),
                 g_mtp_verify_h.data() + (size_t) (n - 1) * n_embd, row_bytes);
     return true;
@@ -888,6 +913,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeResetSession(JNIEnv *, jclass) {
     std::lock_guard<std::mutex> guard(g_lock);
     if (g_ctx)     llama_memory_clear(llama_get_memory(g_ctx), true);
     if (g_sampler) llama_sampler_reset(g_sampler);
+    mtp_reset_locked();
     g_cached_tokens.clear();
 }
 
@@ -1077,11 +1103,14 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
         if (!llama_memory_seq_rm(mem, 0, (llama_pos) common, -1)) {
             LOGI("partial cache eviction unsupported for this model, reprocessing from scratch");
             common = 0;
+        } else if (g_ctx_mtp) {
+            llama_memory_seq_rm(llama_get_memory(g_ctx_mtp), 0, (llama_pos) common, -1);
         }
     }
 
     if (common == 0) {
         llama_memory_clear(mem, true);
+        mtp_reset_locked();
     }
 
     const std::vector<llama_token> tail(tokens.begin() + (long) common, tokens.end());
@@ -1089,6 +1118,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
 
     if (!decode_tokens(tail, (int) common, /*logits_on_last=*/true)) {
         llama_memory_clear(mem, true);
+        mtp_reset_locked();
         g_cached_tokens.clear();
         g_generating.store(false);
         cb.error("E_DECODE|Failed to process the prompt.");
@@ -1222,7 +1252,13 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
         // Drop the rejected tail so the next decode does not read state that
         // belongs to tokens the model just discarded.
         if (accepted < (int) draft.size()) {
+            // Both contexts were fed the whole speculative run, so both have to
+            // forget the part of it that did not survive. Rolling back only the
+            // target leaves the draft head attending to tokens that never
+            // happened -- after which its guesses are worthless, which is
+            // exactly what a near-zero acceptance rate looks like.
             llama_memory_seq_rm(mem, 0, (llama_pos) n_past, -1);
+            llama_memory_seq_rm(llama_get_memory(g_ctx_mtp), 0, (llama_pos) n_past, -1);
         }
         mtp_commit(accepted);
 

@@ -563,7 +563,11 @@ private fun String.withoutReasoning(): String {
 private fun StoredMessage.toUiMessage() = ChatMessage(
     role = role,
     text = text,
-    stats = if (tokenCount > 0) GenerationStats(tokenCount, elapsedMs) else null,
+    stats = if (tokenCount > 0) {
+        GenerationStats(tokenCount, elapsedMs, drafted, accepted)
+    } else {
+        null
+    },
 )
 
 private fun ChatMessage.toStored() = StoredMessage(
@@ -571,6 +575,8 @@ private fun ChatMessage.toStored() = StoredMessage(
     text = text,
     tokenCount = stats?.tokenCount ?: 0,
     elapsedMs = stats?.elapsedMs ?: 0,
+    drafted = stats?.drafted ?: 0,
+    accepted = stats?.accepted ?: 0,
 )
 
 private fun Throwable.readableMessage(): String = when (this) {

@@ -15,6 +15,11 @@ data class StoredMessage(
     val text: String,
     val tokenCount: Int = 0,
     val elapsedMs: Long = 0,
+    // Speculative-decoding counters. Defaulted so chats written before these
+    // existed still load -- Json is configured to ignore unknown keys, and
+    // defaults cover the other direction.
+    val drafted: Int = 0,
+    val accepted: Int = 0,
 )
 
 /** A whole conversation as it sits on disk. */
