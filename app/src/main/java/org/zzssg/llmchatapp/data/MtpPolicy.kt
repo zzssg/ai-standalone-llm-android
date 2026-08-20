@@ -99,15 +99,8 @@ object MtpPolicy {
             return MtpDecision(false, 0, "Waiting until the model reports its size.")
         }
 
-        return if (weightsGb <= budgetGb) {
-            MtpDecision(
-                enabled = true,
-                draft = DEFAULT_DRAFT,
-                reason = "On: a ${format(paramsB(modelParams))} B model fits comfortably in " +
-                    "${format(ramGb)} GB of RAM.",
-            )
-        } else {
-            MtpDecision(
+        if (weightsGb > budgetGb) {
+            return MtpDecision(
                 enabled = false,
                 draft = 0,
                 reason = "Off: a ${format(paramsB(modelParams))} B model leaves too little room on " +
@@ -115,6 +108,26 @@ object MtpPolicy {
                     "and cost more than it saves.",
             )
         }
+
+        // Memory is not the binding constraint -- arithmetic is.
+        //
+        // Speculation assumes a wider batch is nearly free, because a phone is
+        // supposed to be waiting on memory rather than on the CPU. Measured on
+        // the reference device that assumption does not hold: a five-token
+        // verification costs 2.3x a single-token decode, not 1x. Break-even then
+        // needs about 36% of drafted tokens to be accepted, and the measured
+        // rate is far below that, so Auto declines even when memory allows it.
+        //
+        // The setting stays available: the arithmetic changes with a different
+        // SoC, a smaller model, or a stronger draft head, and On is how that
+        // gets tested.
+        return MtpDecision(
+            enabled = false,
+            draft = 0,
+            reason = "Off: on this class of device a wider batch is not free, so drafting " +
+                "costs more than it saves. Turn it on to measure it yourself -- the reply " +
+                "footer reports how many drafted tokens were accepted.",
+        )
     }
 
     /** Largest model, in billions of parameters, that AUTO will enable MTP for. */

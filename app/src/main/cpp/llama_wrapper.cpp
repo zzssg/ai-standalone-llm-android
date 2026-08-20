@@ -259,6 +259,12 @@ struct mtp_batch {
 };
 
 
+// Cumulative time per reply, split by where it goes. Speculation only pays when
+// the draft work is a small fraction of the verification it replaces.
+double g_mtp_ms_draft  = 0.0;
+double g_mtp_ms_target = 0.0;
+double g_mtp_ms_follow = 0.0;
+
 // Puts the draft head back to a blank slate.
 //
 // It has to happen everywhere the target's memory is cleared. The two contexts
@@ -282,6 +288,15 @@ void mtp_reset_locked() {
 // partner until the next decode supplies it.
 bool mtp_follow_target(const std::vector<llama_token> & tokens, int pos0) {
     if (!g_ctx_mtp || tokens.empty()) return false;
+    const auto t_follow = std::chrono::steady_clock::now();
+    struct scope_timer {
+        std::chrono::steady_clock::time_point t;
+        ~scope_timer() {
+            g_mtp_ms_follow += std::chrono::duration_cast<
+                std::chrono::duration<double, std::milli>>(
+                    std::chrono::steady_clock::now() - t).count();
+        }
+    } timer{t_follow};
 
     const int32_t n_embd = g_mtp_n_embd;
     const size_t  row_bytes = (size_t) n_embd * sizeof(float);
@@ -344,7 +359,12 @@ void mtp_commit(int n_accepted) {
 //
 // Greedy on purpose: a draft is a guess that the target will confirm or throw
 // away, so spending sampling variety on it only lowers the acceptance rate.
+// Cumulative time spent in the draft head versus the target, for one reply.
+// Speculation only pays when a draft costs a fraction of a full forward pass;
+// if it costs anything like a full pass, drafting is strictly worse than just
+// generating the token.
 std::vector<llama_token> mtp_draft_tokens(llama_token id_last, int n_past) {
+    const auto t0 = std::chrono::steady_clock::now();
     std::vector<llama_token> draft;
     if (!g_ctx_mtp || g_mtp_draft <= 0) return draft;
 
@@ -377,6 +397,8 @@ std::vector<llama_token> mtp_draft_tokens(llama_token id_last, int n_past) {
 
     llama_sampler_free(greedy);
     mb.free();
+    g_mtp_ms_draft += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+        std::chrono::steady_clock::now() - t0).count();
     return draft;
 }
 
@@ -1134,6 +1156,10 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
         llama_sampler_accept(g_sampler, t);
     }
 
+    g_mtp_ms_draft  = 0.0;
+    g_mtp_ms_target = 0.0;
+    g_mtp_ms_follow = 0.0;
+
     std::string pending;      // bytes held back as an incomplete UTF-8 sequence
     int         n_generated = 0;
     int         n_past      = (int) tokens.size();
@@ -1218,10 +1244,13 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
         run.push_back(id);
         run.insert(run.end(), draft.begin(), draft.end());
 
+        const auto t_verify = std::chrono::steady_clock::now();
         if (!decode_tokens(run, n_past, /*logits_on_last=*/false, /*logits_on_all=*/true)) {
             LOGE("speculative decode failed at position %d", n_past);
             break;
         }
+        g_mtp_ms_target += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            std::chrono::steady_clock::now() - t_verify).count();
         mtp_follow_target(run, n_past);
         n_drafted += (int) draft.size();
 
@@ -1230,8 +1259,26 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
         int accepted = 0;
         llama_token next = -1;
 
+        // Diagnostic for the first round of a reply: whether the draft head is
+        // producing plausible continuations that merely disagree, or unrelated
+        // tokens. The two mean very different things, and an acceptance
+        // percentage alone cannot tell them apart.
+        const bool trace = (n_generated <= 1);
+        if (trace && !draft.empty()) {
+            std::string line;
+            for (llama_token d : draft) line += "'" + token_to_piece(vocab, d) + "' ";
+            LOGI("MTP draft after '%s': %s", token_to_piece(vocab, id).c_str(), line.c_str());
+        }
+
         for (size_t j = 0; j <= draft.size(); ++j) {
             const llama_token sampled = llama_sampler_sample(g_sampler, g_ctx, (int32_t) j);
+
+            if (trace && j < draft.size()) {
+                LOGI("MTP verify[%d]: target='%s' draft='%s' %s", (int) j,
+                     token_to_piece(vocab, sampled).c_str(),
+                     token_to_piece(vocab, draft[j]).c_str(),
+                     sampled == draft[j] ? "MATCH" : "miss");
+            }
 
             if (j < draft.size() && sampled == draft[j]) {
                 emit(sampled);
@@ -1276,6 +1323,9 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
     LOGI("generated %d tokens in %lld ms (%.2f tok/s)", n_generated, (long long) elapsed,
          elapsed > 0 ? n_generated * 1000.0 / (double) elapsed : 0.0);
     if (n_drafted > 0) {
+        LOGI("MTP cost: follow=%.0f ms draft=%.0f ms target=%.0f ms -> each draft token costs %.0f%% of a verify",
+             g_mtp_ms_follow, g_mtp_ms_draft, g_mtp_ms_target,
+             g_mtp_ms_target > 0 ? 100.0 * (g_mtp_ms_draft / n_drafted) / (g_mtp_ms_target / (double) (n_drafted / std::max(1, g_mtp_draft) + 1)) : 0.0);
         // Acceptance is the number that decides whether MTP is worth its memory.
         LOGI("MTP: drafted=%d accepted=%d (%.0f%%)", n_drafted, n_accepted,
              100.0 * n_accepted / (double) n_drafted);

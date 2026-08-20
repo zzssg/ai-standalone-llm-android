@@ -27,13 +27,19 @@ class MtpPolicyTest {
         assertFalse(decide(ramGb = 16.0, paramsB = 1.0, mode = MtpMode.OFF).enabled)
     }
 
-    /** The case that prompted the feature: 4 B on a 12 GB phone. */
+    /**
+     * Auto declines even where memory allows it.
+     *
+     * Measurement on the reference device showed a five-token verification costs
+     * 2.3x a single-token decode, so break-even needs ~36% acceptance and the
+     * measured rate is nowhere near it. Memory was never the binding constraint.
+     */
     @Test
-    fun `auto enables a 4B model on 12 GB`() {
+    fun `auto declines because batching is not free on this class of device`() {
         val d = decide(ramGb = 12.0, paramsB = 4.0)
 
-        assertTrue("12 GB has room for a 4 B model", d.enabled)
-        assertEquals(MtpPolicy.DEFAULT_DRAFT, d.draft)
+        assertFalse("speculation does not pay off here", d.enabled)
+        assertTrue("the reason should name the cause", d.reason.contains("not free"))
     }
 
     /**
@@ -42,7 +48,7 @@ class MtpPolicyTest {
      * would cost more than it saves.
      */
     @Test
-    fun `auto declines the same model on 8 GB`() {
+    fun `memory is checked before anything else`() {
         val d = decide(ramGb = 8.0, paramsB = 4.0)
 
         assertFalse("8 GB is too tight for a 4 B model plus a draft context", d.enabled)
@@ -50,21 +56,18 @@ class MtpPolicyTest {
         assertTrue("the reason should explain the trade", d.reason.contains("out of memory"))
     }
 
+    /** Memory is still checked first, and still reported distinctly. */
     @Test
-    fun `auto enables a small model even on a modest phone`() {
-        assertTrue(decide(ramGb = 8.0, paramsB = 1.5).enabled)
-        assertTrue(decide(ramGb = 6.0, paramsB = 0.5).enabled)
+    fun `a model too large for memory is refused for that reason`() {
+        val d = decide(ramGb = 8.0, paramsB = 8.0)
+
+        assertFalse(d.enabled)
+        assertTrue("memory should be named, not batching", d.reason.contains("out of memory"))
     }
 
     @Test
     fun `auto declines when there is no budget at all`() {
         assertFalse(decide(ramGb = 4.0, paramsB = 1.0).enabled)
-    }
-
-    @Test
-    fun `bigger phones allow bigger models`() {
-        assertTrue(decide(ramGb = 16.0, paramsB = 8.0).enabled)
-        assertTrue(decide(ramGb = 24.0, paramsB = 14.0).enabled)
     }
 
     @Test
