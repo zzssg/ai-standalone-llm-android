@@ -16,12 +16,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Description
-import androidx.compose.material.icons.outlined.Download
-import androidx.compose.material.icons.outlined.ErrorOutline
-import androidx.compose.material.icons.outlined.OpenInNew
-import androidx.compose.material.icons.outlined.Straighten
-import androidx.compose.material.icons.outlined.Widgets
+import androidx.compose.material.icons.rounded.Description
+import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.Error
+import androidx.compose.material.icons.rounded.OpenInNew
+import androidx.compose.material.icons.rounded.Straighten
+import androidx.compose.material.icons.rounded.Widgets
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -99,7 +99,7 @@ fun ModelGuideSheet(totalRamBytes: Long, onDismiss: () -> Unit) {
 
             GuideStep(
                 number = 1,
-                icon = Icons.Outlined.Description,
+                icon = Icons.Rounded.Description,
                 title = "One file, ending in .gguf",
                 body = "GGUF is the only format this app reads. A model published as " +
                     "several .safetensors or .bin files, or as a folder, will not work — " +
@@ -109,14 +109,14 @@ fun ModelGuideSheet(totalRamBytes: Long, onDismiss: () -> Unit) {
 
             GuideStep(
                 number = 2,
-                icon = Icons.Outlined.Download,
+                icon = Icons.Rounded.Download,
                 title = "Download it in your browser",
                 body = "Hugging Face is where these are published. Search for a model " +
                     "name followed by GGUF, open the Files tab, and download one file.",
             ) {
                 Spacer(Modifier.height(Spacing.sm))
                 OutlinedButton(onClick = openCatalogue) {
-                    Icon(Icons.Outlined.OpenInNew, contentDescription = null, Modifier.size(18.dp))
+                    Icon(Icons.Rounded.OpenInNew, contentDescription = null, Modifier.size(18.dp))
                     Spacer(Modifier.size(Spacing.sm))
                     Text("Browse GGUF models")
                 }
@@ -131,7 +131,7 @@ fun ModelGuideSheet(totalRamBytes: Long, onDismiss: () -> Unit) {
 
             GuideStep(
                 number = 3,
-                icon = Icons.Outlined.Straighten,
+                icon = Icons.Rounded.Straighten,
                 title = "Pick the right size",
                 body = "File names carry two numbers. The B number is how big the model is " +
                     "— bigger answers better and runs slower. The Q number is how hard the " +
@@ -144,7 +144,7 @@ fun ModelGuideSheet(totalRamBytes: Long, onDismiss: () -> Unit) {
 
             GuideStep(
                 number = 4,
-                icon = Icons.Outlined.Widgets,
+                icon = Icons.Rounded.Widgets,
                 title = "Choose one built for chatting",
                 body = "Look for Instruct, Chat or IT in the name. Models without it are " +
                     "trained to continue text rather than answer questions, and will " +
@@ -153,7 +153,7 @@ fun ModelGuideSheet(totalRamBytes: Long, onDismiss: () -> Unit) {
 
             GuideStep(
                 number = 5,
-                icon = Icons.Outlined.Download,
+                icon = Icons.Rounded.Download,
                 title = "Import it here",
                 body = "Tap Import and pick the downloaded file. The app copies it into its " +
                     "own storage, so you will briefly need room for two copies, and can " +
@@ -217,7 +217,7 @@ private fun TroubleshootingCard() {
         Column(Modifier.padding(Spacing.md), verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
             Row {
                 Icon(
-                    imageVector = Icons.Outlined.ErrorOutline,
+                    imageVector = Icons.Rounded.Error,
                     contentDescription = null,
                     modifier = Modifier.size(18.dp),
                     tint = MaterialTheme.colorScheme.primary,

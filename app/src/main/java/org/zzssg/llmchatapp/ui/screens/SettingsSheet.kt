@@ -18,12 +18,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Bolt
-import androidx.compose.material.icons.outlined.ExpandMore
-import androidx.compose.material.icons.outlined.Info
-import androidx.compose.material.icons.outlined.Memory
-import androidx.compose.material.icons.outlined.Psychology
-import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.ExpandMore
+import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.Memory
+import androidx.compose.material.icons.rounded.Psychology
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -100,7 +100,7 @@ fun SettingsSheet(
             Text("Settings", style = MaterialTheme.typography.headlineSmall)
 
             // -- Behaviour ---------------------------------------------------
-            SettingsGroup(icon = Icons.Outlined.Psychology, title = "Assistant") {
+            SettingsGroup(icon = Icons.Rounded.Psychology, title = "Assistant") {
                 OutlinedTextField(
                     value = draft.systemPrompt,
                     onValueChange = { draft = draft.copy(systemPrompt = it) },
@@ -137,7 +137,7 @@ fun SettingsSheet(
             }
 
             // -- Output shape -------------------------------------------------
-            SettingsGroup(icon = Icons.Outlined.Tune, title = "Replies") {
+            SettingsGroup(icon = Icons.Rounded.Tune, title = "Replies") {
                 SettingSlider(
                     label = "Creativity",
                     valueLabel = "%.2f".format(draft.sampling.temperature),
@@ -199,7 +199,7 @@ fun SettingsSheet(
             }
 
             // -- Runtime -------------------------------------------------------
-            SettingsGroup(icon = Icons.Outlined.Memory, title = "Performance") {
+            SettingsGroup(icon = Icons.Rounded.Memory, title = "Performance") {
                 SettingSlider(
                     label = "Context window",
                     valueLabel = "${draft.contextSize} tokens",
@@ -375,7 +375,7 @@ private fun DecisionNote(decision: MtpDecision) {
     ) {
         Row(Modifier.padding(Spacing.md), verticalAlignment = Alignment.Top) {
             Icon(
-                imageVector = if (decision.enabled) Icons.Outlined.Bolt else Icons.Outlined.Info,
+                imageVector = if (decision.enabled) Icons.Rounded.Bolt else Icons.Rounded.Info,
                 contentDescription = null,
                 modifier = Modifier.size(16.dp),
             )
@@ -405,7 +405,7 @@ private fun DisclosureHeader(expanded: Boolean, label: String, onToggle: () -> U
             modifier = Modifier.weight(1f),
         )
         Icon(
-            imageVector = Icons.Outlined.ExpandMore,
+            imageVector = Icons.Rounded.ExpandMore,
             contentDescription = null,
             tint = MaterialTheme.colorScheme.primary,
             modifier = Modifier
@@ -430,7 +430,7 @@ private fun ReloadNotice() {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
-                imageVector = Icons.Outlined.Bolt,
+                imageVector = Icons.Rounded.Bolt,
                 contentDescription = null,
                 modifier = Modifier.size(18.dp),
             )

@@ -15,11 +15,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.Chat
-import androidx.compose.material.icons.outlined.Add
-import androidx.compose.material.icons.outlined.DeleteOutline
-import androidx.compose.material.icons.outlined.Layers
-import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material.icons.automirrored.rounded.Chat
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.Layers
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -75,7 +75,7 @@ fun ChatDrawer(
 
             NavigationDrawerItem(
                 label = { Text("New chat") },
-                icon = { Icon(Icons.Outlined.Add, contentDescription = null) },
+                icon = { Icon(Icons.Rounded.Add, contentDescription = null) },
                 selected = activeChatId == null,
                 onClick = onNewChat,
                 modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding),
@@ -120,14 +120,14 @@ fun ChatDrawer(
 
             NavigationDrawerItem(
                 label = { Text("Models") },
-                icon = { Icon(Icons.Outlined.Layers, contentDescription = null) },
+                icon = { Icon(Icons.Rounded.Layers, contentDescription = null) },
                 selected = false,
                 onClick = onOpenModels,
                 modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding),
             )
             NavigationDrawerItem(
                 label = { Text("Settings") },
-                icon = { Icon(Icons.Outlined.Tune, contentDescription = null) },
+                icon = { Icon(Icons.Rounded.Tune, contentDescription = null) },
                 selected = false,
                 onClick = onOpenSettings,
                 modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding),
@@ -169,11 +169,11 @@ private fun ChatRow(
                 overflow = TextOverflow.Ellipsis,
             )
         },
-        icon = { Icon(Icons.AutoMirrored.Outlined.Chat, contentDescription = null) },
+        icon = { Icon(Icons.AutoMirrored.Rounded.Chat, contentDescription = null) },
         badge = {
             IconButton(onClick = onDelete, modifier = Modifier.size(40.dp)) {
                 Icon(
-                    imageVector = Icons.Outlined.DeleteOutline,
+                    imageVector = Icons.Rounded.Delete,
                     contentDescription = "Delete ${chat.title}",
                     modifier = Modifier.size(18.dp),
                 )
@@ -194,7 +194,7 @@ private fun EmptyHistory() {
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Icon(
-            imageVector = Icons.AutoMirrored.Outlined.Chat,
+            imageVector = Icons.AutoMirrored.Rounded.Chat,
             contentDescription = null,
             modifier = Modifier.size(28.dp),
             tint = MaterialTheme.colorScheme.onSurfaceVariant,

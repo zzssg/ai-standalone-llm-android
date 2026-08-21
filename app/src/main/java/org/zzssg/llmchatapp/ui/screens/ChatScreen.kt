@@ -29,15 +29,15 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.Chat
-import androidx.compose.material.icons.automirrored.outlined.Send
-import androidx.compose.material.icons.outlined.ArrowDownward
-import androidx.compose.material.icons.outlined.Bolt
-import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.Menu
-import androidx.compose.material.icons.outlined.Psychology
-import androidx.compose.material.icons.outlined.Stop
-import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material.icons.automirrored.rounded.Chat
+import androidx.compose.material.icons.automirrored.rounded.Send
+import androidx.compose.material.icons.rounded.ArrowDownward
+import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Menu
+import androidx.compose.material.icons.rounded.Psychology
+import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -77,6 +77,12 @@ import org.zzssg.llmchatapp.ui.ModelUiState
 import org.zzssg.llmchatapp.ui.UserFacingError
 import org.zzssg.llmchatapp.ui.components.MessageBubble
 import org.zzssg.llmchatapp.ui.theme.MinTouchTarget
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.ui.draw.scale
+import org.zzssg.llmchatapp.ui.components.MascotBadge
 import org.zzssg.llmchatapp.ui.theme.Spacing
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -160,12 +166,12 @@ fun ChatScreen(
                 },
                 navigationIcon = {
                     IconButton(onClick = onOpenMenu) {
-                        Icon(Icons.Outlined.Menu, contentDescription = "Chats and settings")
+                        Icon(Icons.Rounded.Menu, contentDescription = "Chats and settings")
                     }
                 },
                 actions = {
                     IconButton(onClick = onOpenSettings) {
-                        Icon(Icons.Outlined.Tune, contentDescription = "Settings")
+                        Icon(Icons.Rounded.Tune, contentDescription = "Settings")
                     }
                 },
             )
@@ -229,7 +235,7 @@ fun ChatScreen(
                     },
                     modifier = Modifier.size(44.dp),
                 ) {
-                    Icon(Icons.Outlined.ArrowDownward, contentDescription = "Scroll to latest")
+                    Icon(Icons.Rounded.ArrowDownward, contentDescription = "Scroll to latest")
                 }
             }
         }
@@ -359,15 +365,32 @@ private fun Composer(
                             contentColor = MaterialTheme.colorScheme.onErrorContainer,
                         ),
                     ) {
-                        Icon(Icons.Outlined.Stop, contentDescription = "Stop generating")
+                        Icon(Icons.Rounded.Stop, contentDescription = "Stop generating")
                     }
                 } else {
+                    val interaction = remember { MutableInteractionSource() }
+                    val pressed by interaction.collectIsPressedAsState()
+                    val squish by animateFloatAsState(
+                        targetValue = if (pressed) 0.9f else 1f,
+                        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+                        label = "send",
+                    )
+
                     FilledIconButton(
                         onClick = onSend,
                         enabled = state.isReady && !state.isReloading && draft.isNotBlank(),
-                        modifier = Modifier.size(MinTouchTarget),
+                        interactionSource = interaction,
+                        modifier = Modifier
+                            .size(MinTouchTarget)
+                            // Scale only: it never moves what is around it, so
+                            // the composer cannot jitter under a fast typist.
+                            .scale(squish),
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = MaterialTheme.colorScheme.onPrimary,
+                        ),
                     ) {
-                        Icon(Icons.AutoMirrored.Outlined.Send, contentDescription = "Send")
+                        Icon(Icons.AutoMirrored.Rounded.Send, contentDescription = "Send")
                     }
                 }
             }
@@ -407,7 +430,7 @@ private fun ThinkingChip(
             label = { Text(if (thinkingOn) "Thinking on" else "Thinking off") },
             leadingIcon = {
                 Icon(
-                    imageVector = if (thinkingOn) Icons.Outlined.Psychology else Icons.Outlined.Bolt,
+                    imageVector = if (thinkingOn) Icons.Rounded.Psychology else Icons.Rounded.Bolt,
                     contentDescription = null,
                     modifier = Modifier.size(FilterChipDefaults.IconSize),
                 )
@@ -435,14 +458,11 @@ private fun EmptyTranscript(modifier: Modifier = Modifier) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Icon(
-            imageVector = Icons.AutoMirrored.Outlined.Chat,
-            contentDescription = null,
-            modifier = Modifier.size(40.dp),
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(Spacing.md))
-        Text("Ask anything", style = MaterialTheme.typography.titleMedium)
+        // The mascot again, so an empty chat is an invitation rather than a
+        // blank page with a grey glyph on it.
+        MascotBadge(size = 132.dp)
+        Spacer(Modifier.height(Spacing.sm))
+        Text("Ask anything", style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(Spacing.xs))
         Text(
             text = "Replies are generated on this device, so the first tokens take " +
@@ -489,7 +509,7 @@ private fun ErrorBanner(
                 }
                 IconButton(onClick = onDismiss, modifier = Modifier.size(40.dp)) {
                     Icon(
-                        Icons.Outlined.Close,
+                        Icons.Rounded.Close,
                         contentDescription = "Dismiss",
                         modifier = Modifier.size(18.dp),
                     )

@@ -2,7 +2,9 @@ package org.zzssg.llmchatapp.ui.theme
 
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Shapes
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
@@ -17,79 +19,118 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
-// A warm honey-and-rose palette on ivory neutrals.
-//
-// Chosen against the grain of the category: on-device AI tooling defaults to cool
-// slate-and-teal, which reads as infrastructure. This app is something you talk
-// to, so the neutrals carry a warm bias rather than being pure grey, and the
-// accent is a honey amber with a rose secondary for the quieter surfaces.
-//
-// Both themes are defined together and share the same role structure, so a
-// component styled through the tokens is correct in either.
+/*
+ * The palette comes from the mascot: a squirrel with a magnifying glass, small
+ * but clever, which is the same joke as running a small model on a phone.
+ * Everything follows from those two objects -- fur orange for anything the user
+ * acts on, lens teal for anything the app has worked out, leaf green for the
+ * measurements it reports -- and the neutrals are warm rather than grey, so the
+ * app reads as something you talk to and not as infrastructure.
+ *
+ * Orange this saturated cannot carry white text at body size, so onPrimary is a
+ * dark warm ink instead. That is the deliberate trade: the colour stays vivid
+ * and the label still clears 5:1, where a white-on-orange button would have sat
+ * at 2.8:1 and failed.
+ */
+
+/** Squirrel fur. Every primary action in the app is this colour. */
+private val FurOrange = Color(0xFFEA6A0A)
+private val FurInk = Color(0xFF2B1A10)
+
+/** The lens: what the app has figured out -- reasoning, model info, stats. */
+private val LensTeal = Color(0xFF0F7C96)
+
+/** Leaf. Reserved for the positive/measured, so it never competes with the CTA. */
+private val LeafGreen = Color(0xFF3F7A22)
+
 private val LightColors = lightColorScheme(
-    primary = Color(0xFF8F5A00),
-    onPrimary = Color(0xFFFFFFFF),
-    primaryContainer = Color(0xFFFFDDB0),
-    onPrimaryContainer = Color(0xFF2D1600),
+    primary = FurOrange,
+    onPrimary = FurInk,
+    primaryContainer = Color(0xFFFFE3CC),
+    onPrimaryContainer = Color(0xFF5C2A00),
 
-    secondary = Color(0xFF8C4A5F),
+    secondary = LensTeal,
     onSecondary = Color(0xFFFFFFFF),
-    secondaryContainer = Color(0xFFFFD9E2),
-    onSecondaryContainer = Color(0xFF3A0A1C),
+    secondaryContainer = Color(0xFFCDEEF5),
+    onSecondaryContainer = Color(0xFF00323F),
 
-    tertiary = Color(0xFF4F6354),
+    tertiary = LeafGreen,
     onTertiary = Color(0xFFFFFFFF),
-    tertiaryContainer = Color(0xFFD1E8D5),
-    onTertiaryContainer = Color(0xFF0C1F13),
+    tertiaryContainer = Color(0xFFD6F2C4),
+    onTertiaryContainer = Color(0xFF123D00),
 
-    background = Color(0xFFFFF8F3),
-    onBackground = Color(0xFF211A14),
-    surface = Color(0xFFFFF8F3),
-    onSurface = Color(0xFF211A14),
-    surfaceVariant = Color(0xFFF2E0D0),
-    onSurfaceVariant = Color(0xFF51443A),
-    surfaceContainerHighest = Color(0xFFF6E7DA),
+    background = Color(0xFFFFF8F2),
+    onBackground = Color(0xFF3A2A1E),
+    surface = Color(0xFFFFF8F2),
+    onSurface = Color(0xFF3A2A1E),
+    surfaceVariant = Color(0xFFFAE7D8),
+    onSurfaceVariant = Color(0xFF7A6252),
+    // The reply card. Plain white on the cream ground is what separates the
+    // two speakers; the previous pairing put a tinted card next to a tinted
+    // bubble and both read as the same voice.
+    surfaceContainerLow = Color(0xFFFFFFFF),
+    surfaceContainer = Color(0xFFFDF0E6),
+    surfaceContainerHigh = Color(0xFFF9E9DC),
+    surfaceContainerHighest = Color(0xFFF6E3D2),
 
-    outline = Color(0xFF84766A),
-    outlineVariant = Color(0xFFD6C3B4),
+    outline = Color(0xFFA07B60),
+    outlineVariant = Color(0xFFEBD5C3),
 
-    error = Color(0xFFA4302A),
+    error = Color(0xFFC1272D),
     onError = Color(0xFFFFFFFF),
-    errorContainer = Color(0xFFFFDAD5),
-    onErrorContainer = Color(0xFF410100),
+    errorContainer = Color(0xFFFFDAD7),
+    onErrorContainer = Color(0xFF470005),
 )
 
 private val DarkColors = darkColorScheme(
-    primary = Color(0xFFFFB95C),
-    onPrimary = Color(0xFF4A2800),
-    primaryContainer = Color(0xFF6B3D00),
-    onPrimaryContainer = Color(0xFFFFDDB0),
+    primary = Color(0xFFFFA766),
+    onPrimary = Color(0xFF4A1F00),
+    primaryContainer = Color(0xFF7A3400),
+    onPrimaryContainer = Color(0xFFFFE3CC),
 
-    secondary = Color(0xFFFFB1C5),
-    onSecondary = Color(0xFF54233A),
-    secondaryContainer = Color(0xFF6F3950),
-    onSecondaryContainer = Color(0xFFFFD9E2),
+    secondary = Color(0xFF5CD3EA),
+    onSecondary = Color(0xFF00323F),
+    secondaryContainer = Color(0xFF00505F),
+    onSecondaryContainer = Color(0xFFCDEEF5),
 
-    tertiary = Color(0xFFB5CCBA),
-    onTertiary = Color(0xFF213528),
-    tertiaryContainer = Color(0xFF374B3D),
-    onTertiaryContainer = Color(0xFFD1E8D5),
+    tertiary = Color(0xFF9CD97A),
+    onTertiary = Color(0xFF16330A),
+    tertiaryContainer = Color(0xFF2C5417),
+    onTertiaryContainer = Color(0xFFD6F2C4),
 
-    background = Color(0xFF19120C),
-    onBackground = Color(0xFFEDE0D6),
-    surface = Color(0xFF19120C),
-    onSurface = Color(0xFFEDE0D6),
-    surfaceVariant = Color(0xFF51443A),
-    onSurfaceVariant = Color(0xFFD6C3B4),
-    surfaceContainerHighest = Color(0xFF2A211A),
+    background = Color(0xFF17110D),
+    onBackground = Color(0xFFF5EAE1),
+    surface = Color(0xFF17110D),
+    onSurface = Color(0xFFF5EAE1),
+    surfaceVariant = Color(0xFF3A2C23),
+    onSurfaceVariant = Color(0xFFD2BCA9),
+    surfaceContainerLow = Color(0xFF211913),
+    surfaceContainer = Color(0xFF231A14),
+    surfaceContainerHigh = Color(0xFF2A201A),
+    surfaceContainerHighest = Color(0xFF352921),
 
-    outline = Color(0xFF9E8E81),
-    outlineVariant = Color(0xFF51443A),
+    outline = Color(0xFF9C8371),
+    outlineVariant = Color(0xFF3A2C23),
 
-    error = Color(0xFFFFB4AB),
-    onError = Color(0xFF690005),
-    errorContainer = Color(0xFF93000A),
-    onErrorContainer = Color(0xFFFFDAD6),
+    error = Color(0xFFFF9A93),
+    onError = Color(0xFF5C0009),
+    errorContainer = Color(0xFF8C1A20),
+    onErrorContainer = Color(0xFFFFDAD7),
+)
+
+/**
+ * Rounder than Material's defaults, all the way up the scale.
+ *
+ * The recommended direction for a mascot-led product is claymorphism: soft,
+ * inflated, tactile. Radius is most of that, and it has to be applied as a scale
+ * rather than per component or the shapes stop rhyming with each other.
+ */
+private val AppShapes = Shapes(
+    extraSmall = RoundedCornerShape(10.dp),
+    small = RoundedCornerShape(14.dp),
+    medium = RoundedCornerShape(20.dp),
+    large = RoundedCornerShape(26.dp),
+    extraLarge = RoundedCornerShape(34.dp),
 )
 
 private val AppTypography = Typography().let { base ->
@@ -98,8 +139,21 @@ private val AppTypography = Typography().let { base ->
         // the Material default.
         bodyLarge = base.bodyLarge.copy(fontSize = 16.sp, lineHeight = 24.sp),
         bodyMedium = base.bodyMedium.copy(fontSize = 15.sp, lineHeight = 22.sp),
-        titleMedium = base.titleMedium.copy(fontWeight = FontWeight.SemiBold),
-        labelLarge = base.labelLarge.copy(fontWeight = FontWeight.Medium),
+
+        // Headings carry the friendliness the recommended typeface would have
+        // carried. Without a rounded face to bundle, weight and tighter tracking
+        // are what separate a warm heading from a system-default one.
+        headlineSmall = base.headlineSmall.copy(
+            fontWeight = FontWeight.ExtraBold,
+            letterSpacing = (-0.5).sp,
+        ),
+        titleLarge = base.titleLarge.copy(
+            fontWeight = FontWeight.Bold,
+            letterSpacing = (-0.3).sp,
+        ),
+        titleMedium = base.titleMedium.copy(fontWeight = FontWeight.Bold),
+        titleSmall = base.titleSmall.copy(fontWeight = FontWeight.Bold),
+        labelLarge = base.labelLarge.copy(fontWeight = FontWeight.Bold),
     )
 }
 
@@ -132,7 +186,16 @@ val MinTouchTarget = 48.dp
 @Composable
 fun LlmChatTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
-    dynamicColor: Boolean = true,
+    /**
+     * Off by default, which is the whole point of having a palette.
+     *
+     * Material You derives colours from the wallpaper, and on most devices that
+     * lands somewhere in blue-grey -- so the brand palette below was defined,
+     * shipped, and then never seen by anyone on Android 12 or later. A product
+     * with a mascot has an identity to keep; the opt-in stays for anyone who
+     * prefers their system colours.
+     */
+    dynamicColor: Boolean = false,
     content: @Composable () -> Unit,
 ) {
     val colorScheme = when {
@@ -147,6 +210,7 @@ fun LlmChatTheme(
 
     MaterialTheme(
         colorScheme = colorScheme,
+        shapes = AppShapes,
         typography = AppTypography,
         content = content,
     )

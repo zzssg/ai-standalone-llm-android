@@ -16,10 +16,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Add
-import androidx.compose.material.icons.outlined.CheckCircle
-import androidx.compose.material.icons.outlined.DeleteOutline
-import androidx.compose.material.icons.outlined.HelpOutline
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.Help
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -83,7 +83,7 @@ fun ModelSheet(
                 // the user goes looking for a better model.
                 IconButton(onClick = onOpenGuide) {
                     Icon(
-                        imageVector = Icons.Outlined.HelpOutline,
+                        imageVector = Icons.Rounded.Help,
                         contentDescription = "How to add a model",
                     )
                 }
@@ -152,7 +152,7 @@ fun ModelSheet(
                     .fillMaxWidth()
                     .height(48.dp),
             ) {
-                Icon(Icons.Outlined.Add, contentDescription = null, Modifier.size(18.dp))
+                Icon(Icons.Rounded.Add, contentDescription = null, Modifier.size(18.dp))
                 Spacer(Modifier.size(Spacing.sm))
                 Text("Import a .gguf file")
             }
@@ -225,7 +225,7 @@ private fun ModelRow(
 
             if (isActive) {
                 Icon(
-                    imageVector = Icons.Outlined.CheckCircle,
+                    imageVector = Icons.Rounded.CheckCircle,
                     contentDescription = "Currently open",
                     modifier = Modifier.size(20.dp),
                 )
@@ -233,7 +233,7 @@ private fun ModelRow(
             }
 
             IconButton(onClick = onDelete, enabled = enabled) {
-                Icon(Icons.Outlined.DeleteOutline, contentDescription = "Delete ${model.displayName}")
+                Icon(Icons.Rounded.Delete, contentDescription = "Delete ${model.displayName}")
             }
         }
     }

@@ -14,10 +14,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Add
-import androidx.compose.material.icons.outlined.CloudOff
-import androidx.compose.material.icons.outlined.Memory
-import androidx.compose.material.icons.outlined.Speed
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.CloudOff
+import androidx.compose.material.icons.rounded.Folder
+import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -34,7 +34,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import org.zzssg.llmchatapp.data.ModelSizeAdvice
 import org.zzssg.llmchatapp.data.formatBytes
+import androidx.compose.ui.text.font.FontWeight
 import org.zzssg.llmchatapp.ui.ModelUiState
+import org.zzssg.llmchatapp.ui.components.IconTile
+import org.zzssg.llmchatapp.ui.components.LeafTile
+import org.zzssg.llmchatapp.ui.components.LensTile
+import org.zzssg.llmchatapp.ui.components.MascotBadge
 import org.zzssg.llmchatapp.ui.theme.Spacing
 
 /**
@@ -64,14 +69,11 @@ fun WelcomeScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Icon(
-            imageVector = Icons.Outlined.Memory,
-            contentDescription = null,
-            modifier = Modifier.size(56.dp),
-            tint = MaterialTheme.colorScheme.primary,
-        )
+        // The character, not a chip glyph. This is the first thing anyone sees
+        // of the product, and a mascot is what separates it from a utility.
+        MascotBadge(size = 148.dp)
 
-        Spacer(Modifier.height(Spacing.lg))
+        Spacer(Modifier.height(Spacing.sm))
 
         Text(
             text = "Chat with a model on your phone",
@@ -107,7 +109,7 @@ fun WelcomeScreen(
                         .widthIn(max = 380.dp)
                         .height(52.dp),
                 ) {
-                    Icon(Icons.Outlined.Add, contentDescription = null, Modifier.size(20.dp))
+                    Icon(Icons.Rounded.Add, contentDescription = null, Modifier.size(20.dp))
                     Spacer(Modifier.size(Spacing.sm))
                     Text("Add a model")
                 }
@@ -152,13 +154,14 @@ private fun GuidanceCard(totalRamBytes: Long, onOpenGuide: () -> Unit) {
                 style = MaterialTheme.typography.titleSmall,
             )
             GuidanceRow(
-                icon = Icons.Outlined.Memory,
+                icon = Icons.Rounded.Folder,
                 title = "A .gguf model file",
                 body = "Download one in your browser, then pick it here. Names containing " +
                     "Instruct or Chat are the ones that answer questions.",
             )
             GuidanceRow(
-                icon = Icons.Outlined.Speed,
+                tile = { LeafTile(it, size = 38.dp) },
+                icon = Icons.Rounded.Speed,
                 // The number, not the platitude: the old text said 1-3 B suited
                 // most phones, which undersold a 12 GB device and oversold a
                 // 4 GB one. The phone knows its own memory.
@@ -172,7 +175,8 @@ private fun GuidanceCard(totalRamBytes: Long, onOpenGuide: () -> Unit) {
                 },
             )
             GuidanceRow(
-                icon = Icons.Outlined.CloudOff,
+                tile = { LensTile(it, size = 38.dp) },
+                icon = Icons.Rounded.CloudOff,
                 title = "Works offline",
                 body = "Once a model is imported there is no network traffic at all.",
             )
@@ -188,16 +192,20 @@ private fun GuidanceCard(totalRamBytes: Long, onOpenGuide: () -> Unit) {
 }
 
 @Composable
-private fun GuidanceRow(icon: ImageVector, title: String, body: String) {
+private fun GuidanceRow(
+    icon: ImageVector,
+    title: String,
+    body: String,
+    tile: @Composable (ImageVector) -> Unit = { IconTile(it, size = 38.dp) },
+) {
     Row(horizontalArrangement = Arrangement.spacedBy(Spacing.md)) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            modifier = Modifier.size(20.dp),
-            tint = MaterialTheme.colorScheme.primary,
-        )
+        tile(icon)
         Column {
-            Text(title, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
             Text(
                 text = body,
                 style = MaterialTheme.typography.bodySmall,

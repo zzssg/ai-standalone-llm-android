@@ -20,9 +20,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.ContentCopy
-import androidx.compose.material.icons.outlined.ExpandMore
-import androidx.compose.material.icons.outlined.Psychology
+import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.ExpandMore
+import androidx.compose.material.icons.rounded.Psychology
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LocalTextStyle
@@ -227,7 +227,7 @@ private fun CodeBlock(block: MarkdownBlock.Code, onCopy: (String) -> Unit) {
                 )
                 IconButton(onClick = { onCopy(block.code) }, modifier = Modifier.size(32.dp)) {
                     Icon(
-                        imageVector = Icons.Outlined.ContentCopy,
+                        imageVector = Icons.Rounded.ContentCopy,
                         contentDescription = "Copy code",
                         modifier = Modifier.size(16.dp),
                     )
@@ -277,7 +277,7 @@ private fun ReasoningBlock(block: MarkdownBlock.Reasoning) {
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
-                    imageVector = Icons.Outlined.Psychology,
+                    imageVector = Icons.Rounded.Psychology,
                     contentDescription = null,
                     modifier = Modifier.size(16.dp),
                 )
@@ -288,7 +288,7 @@ private fun ReasoningBlock(block: MarkdownBlock.Reasoning) {
                     modifier = Modifier.weight(1f),
                 )
                 Icon(
-                    imageVector = Icons.Outlined.ExpandMore,
+                    imageVector = Icons.Rounded.ExpandMore,
                     contentDescription = null,
                     modifier = Modifier
                         .size(18.dp)

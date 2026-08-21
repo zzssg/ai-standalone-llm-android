@@ -15,7 +15,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -30,6 +30,7 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.BorderStroke
 import org.zzssg.llmchatapp.ui.ChatMessage
 import org.zzssg.llmchatapp.ui.theme.Spacing
 
@@ -57,15 +58,22 @@ fun MessageBubble(
                 bottomStart = if (isUser) 16.dp else 4.dp,
                 bottomEnd = if (isUser) 4.dp else 16.dp,
             ),
+            // Two clearly different surfaces, because who said what is the one
+            // thing a transcript has to make obvious at a glance.
             color = if (isUser) {
                 MaterialTheme.colorScheme.primaryContainer
             } else {
-                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                MaterialTheme.colorScheme.surfaceContainerLow
             },
             contentColor = if (isUser) {
                 MaterialTheme.colorScheme.onPrimaryContainer
             } else {
                 MaterialTheme.colorScheme.onSurface
+            },
+            border = if (isUser) {
+                null
+            } else {
+                BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
             },
         ) {
             Column(Modifier.padding(Spacing.md)) {
@@ -108,7 +116,7 @@ private fun MessageFooter(message: ChatMessage, canCopy: Boolean, onCopy: () -> 
     ) {
         IconButton(onClick = onCopy, enabled = canCopy, modifier = Modifier.size(32.dp)) {
             Icon(
-                imageVector = Icons.Outlined.ContentCopy,
+                imageVector = Icons.Rounded.ContentCopy,
                 contentDescription = "Copy reply",
                 modifier = Modifier.size(16.dp),
             )
@@ -146,9 +154,14 @@ fun TypingIndicator(modifier: Modifier = Modifier) {
         modifier = modifier
             .padding(vertical = Spacing.xs)
             .semantics { contentDescription = "The model is writing a reply" },
-        horizontalArrangement = Arrangement.spacedBy(Spacing.xs),
+        horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // The mascot does the waiting, which turns the dullest moment in the app
+        // -- the seconds before the first token -- into the one with the most
+        // character in it.
+        Mascot(size = 28.dp)
+
         repeat(3) { index ->
             val alpha by transition.animateFloat(
                 initialValue = 0.25f,

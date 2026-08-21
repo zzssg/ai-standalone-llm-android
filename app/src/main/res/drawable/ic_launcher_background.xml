@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Launcher background: the honey of the app's own primary colour, as a soft
-    vertical gradient so the icon does not read as a flat swatch next to the
-    rounded, shaded icons Android ships with.
+    Launcher background: the lens colour, as a soft diagonal gradient.
+
+    Deliberately the cool half of the palette rather than another orange. The
+    mascot is fur-orange, and a warm background would leave it competing with
+    its own field; teal is the complement, so the squirrel reads at the size a
+    launcher actually shows it.
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
@@ -19,8 +22,8 @@
                 android:endX="108"
                 android:endY="108"
                 android:type="linear">
-                <item android:offset="0.0" android:color="#FFF0A030" />
-                <item android:offset="1.0" android:color="#FFB26A00" />
+                <item android:offset="0.0" android:color="#FF17A2BF" />
+                <item android:offset="1.0" android:color="#FF0B5F74" />
             </gradient>
         </aapt:attr>
     </path>
