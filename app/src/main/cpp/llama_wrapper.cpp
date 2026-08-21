@@ -22,6 +22,8 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "llama.h"
+// Staging API for multi-token prediction. See the note in CMakeLists.txt.
+#include "llama-ext.h"
 
 #define LOG_TAG "LlamaWrapper"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -42,6 +44,30 @@ std::mutex g_lock;
 llama_model   * g_model   = nullptr;
 llama_context * g_ctx     = nullptr;
 llama_sampler * g_sampler = nullptr;
+
+// Multi-token prediction.
+//
+// The model ships a small extra decoder block ("nextn"/MTP) trained to guess the
+// token after next. Running it is far cheaper than a full forward pass, so it can
+// draft several tokens which the main model then confirms in a single batch --
+// reading the multi-gigabyte weights once instead of once per token.
+//
+// That trade is exactly right here: generation on a phone is bound by memory
+// bandwidth, not by arithmetic, so the extra compute of a wider batch is close to
+// free while the saved weight reads are the whole cost.
+llama_context * g_ctx_mtp = nullptr;   // draft context, shares g_model
+int             g_mtp_draft = 0;       // tokens to draft per step; 0 disables MTP
+int             g_mtp_n_embd = 0;      // width of a hidden-state row
+
+// Hidden state carried between calls: the MTP head pairs the hidden state at
+// position p with the token at p+1, so the final row of one decode has to wait
+// for the next one to find its partner.
+std::vector<float> g_mtp_pending_h;
+
+// Hidden rows from the most recent target batch, used to re-seed g_mtp_pending_h
+// once we know how many drafted tokens were accepted.
+std::vector<float> g_mtp_verify_h;
+int                g_mtp_verify_rows = 0;
 
 // Read from the UI thread on every recomposition, so these must never block.
 std::atomic<bool> g_model_loaded{false};
@@ -188,6 +214,194 @@ size_t utf8_safe_len(const std::string & s) {
     return n;
 }
 
+
+// ---------------------------------------------------------------------------
+// Multi-token prediction
+// ---------------------------------------------------------------------------
+
+// A batch that carries tokens *and* hidden states.
+//
+// llama_batch_init allocates one or the other, never both, but the MTP head is
+// fed a token together with the hidden state that preceded it. The reference
+// implementation in common/speculative.cpp works around this the same way.
+struct mtp_batch {
+    llama_batch batch{};
+    bool token_owned = false;
+
+    void init(int32_t capacity, int32_t n_embd) {
+        batch = llama_batch_init(capacity, n_embd, /*n_seq_max=*/ 1);
+        batch.token = (llama_token *) malloc(sizeof(llama_token) * (size_t) capacity);
+        token_owned = batch.token != nullptr;
+    }
+
+    void free() {
+        if (token_owned && batch.token) {
+            ::free(batch.token);
+            batch.token = nullptr;
+        }
+        token_owned = false;
+        llama_batch_free(batch);
+        batch = llama_batch{};
+    }
+
+    void clear() { batch.n_tokens = 0; }
+
+    void add(llama_token id, llama_pos pos, const float * h, int32_t n_embd, bool logits) {
+        const int32_t i = batch.n_tokens;
+        batch.token[i]     = id;
+        batch.pos[i]       = pos;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = logits;
+        std::memcpy(batch.embd + (size_t) i * n_embd, h, (size_t) n_embd * sizeof(float));
+        batch.n_tokens = i + 1;
+    }
+};
+
+
+// Cumulative time per reply, split by where it goes. Speculation only pays when
+// the draft work is a small fraction of the verification it replaces.
+double g_mtp_ms_draft  = 0.0;
+double g_mtp_ms_target = 0.0;
+double g_mtp_ms_follow = 0.0;
+
+// Puts the draft head back to a blank slate.
+//
+// It has to happen everywhere the target's memory is cleared. The two contexts
+// only produce useful drafts while they agree on what has been said, and leaving
+// the draft head holding a previous conversation makes its decode either fail
+// outright or return guesses about a history that no longer exists.
+void mtp_reset_locked() {
+    if (!g_ctx_mtp) return;
+    llama_memory_clear(llama_get_memory(g_ctx_mtp), true);
+    std::fill(g_mtp_pending_h.begin(), g_mtp_pending_h.end(), 0.0f);
+    g_mtp_verify_h.clear();
+    g_mtp_verify_rows = 0;
+}
+
+// Mirrors the target's decode into the draft head.
+//
+// The MTP head predicts the token after next, so it pairs the hidden state at
+// position p with the token at p+1: the hidden rows are shifted right by one and
+// the gap at the front is filled from the previous call. That carryover is the
+// whole reason g_mtp_pending_h exists -- the last row of one decode has no
+// partner until the next decode supplies it.
+bool mtp_follow_target(const std::vector<llama_token> & tokens, int pos0) {
+    if (!g_ctx_mtp || tokens.empty()) return false;
+    const auto t_follow = std::chrono::steady_clock::now();
+    struct scope_timer {
+        std::chrono::steady_clock::time_point t;
+        ~scope_timer() {
+            g_mtp_ms_follow += std::chrono::duration_cast<
+                std::chrono::duration<double, std::milli>>(
+                    std::chrono::steady_clock::now() - t).count();
+        }
+    } timer{t_follow};
+
+    const int32_t n_embd = g_mtp_n_embd;
+    const size_t  row_bytes = (size_t) n_embd * sizeof(float);
+    const int32_t n = (int32_t) tokens.size();
+
+    mtp_batch mb;
+    mb.init(n, n_embd);
+    if (!mb.token_owned) { mb.free(); return false; }
+
+    const float * h_tgt = llama_get_embeddings_nextn(g_ctx);
+    if (!h_tgt) { mb.free(); return false; }
+
+    // Copy the target's rows out before touching the draft context, so nothing
+    // depends on how long that pointer stays valid across another decode.
+    //
+    // h_nextn covers every position in the batch. The _ith accessor would index
+    // the output-ordered view instead, which only lines up when logits were
+    // requested on every row -- and the prompt is decoded with logits on its
+    // last token alone.
+    g_mtp_verify_rows = n;
+    g_mtp_verify_h.resize((size_t) n * n_embd);
+    std::memcpy(g_mtp_verify_h.data(), h_tgt, row_bytes * (size_t) n);
+
+    // The MTP head pairs the hidden state at position p with the token at p+1,
+    // so the rows shift right by one and the gap at the front is filled from the
+    // previous call.
+    for (int32_t i = 0; i < n; ++i) {
+        const float * h = (i == 0)
+            ? g_mtp_pending_h.data()
+            : (g_mtp_verify_h.data() + (size_t) (i - 1) * n_embd);
+        mb.add(tokens[(size_t) i], pos0 + i, h, n_embd, /*logits=*/ false);
+    }
+
+    const int rc = llama_decode(g_ctx_mtp, mb.batch);
+    mb.free();
+    if (rc != 0) {
+        g_mtp_verify_rows = 0;
+        LOGW("MTP follow decode failed rc=%d", rc);
+        return false;
+    }
+
+    // Keep the target's rows: which one becomes the next carryover depends on
+    // how many drafted tokens survive verification, and that is not known yet.
+    std::memcpy(g_mtp_pending_h.data(),
+                g_mtp_verify_h.data() + (size_t) (n - 1) * n_embd, row_bytes);
+    return true;
+}
+
+// Once verification is done, the carryover is the hidden row belonging to the
+// last token that survived.
+void mtp_commit(int n_accepted) {
+    if (g_mtp_verify_rows <= 0) return;
+    const int i = std::min(n_accepted, g_mtp_verify_rows - 1);
+    std::memcpy(g_mtp_pending_h.data(),
+                g_mtp_verify_h.data() + (size_t) i * g_mtp_n_embd,
+                (size_t) g_mtp_n_embd * sizeof(float));
+}
+
+// Runs the draft head forward to guess up to g_mtp_draft tokens.
+//
+// Greedy on purpose: a draft is a guess that the target will confirm or throw
+// away, so spending sampling variety on it only lowers the acceptance rate.
+// Cumulative time spent in the draft head versus the target, for one reply.
+// Speculation only pays when a draft costs a fraction of a full forward pass;
+// if it costs anything like a full pass, drafting is strictly worse than just
+// generating the token.
+std::vector<llama_token> mtp_draft_tokens(llama_token id_last, int n_past) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<llama_token> draft;
+    if (!g_ctx_mtp || g_mtp_draft <= 0) return draft;
+
+    const int32_t n_embd = g_mtp_n_embd;
+
+    mtp_batch mb;
+    mb.init(1, n_embd);
+    if (!mb.token_owned) { mb.free(); return draft; }
+
+    llama_sampler * greedy = llama_sampler_init_greedy();
+    if (!greedy) { mb.free(); return draft; }
+
+    std::vector<float> h(g_mtp_pending_h);
+
+    for (int i = 0; i < g_mtp_draft; ++i) {
+        mb.clear();
+        const llama_token id = draft.empty() ? id_last : draft.back();
+        mb.add(id, n_past + i, h.data(), n_embd, /*logits=*/ true);
+
+        if (llama_decode(g_ctx_mtp, mb.batch) != 0) break;
+
+        const llama_token next = llama_sampler_sample(greedy, g_ctx_mtp, 0);
+        if (next < 0) break;
+        draft.push_back(next);
+
+        const float * h_row = llama_get_embeddings_nextn_ith(g_ctx_mtp, 0);
+        if (!h_row) break;
+        h.assign(h_row, h_row + n_embd);
+    }
+
+    llama_sampler_free(greedy);
+    mb.free();
+    g_mtp_ms_draft += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+        std::chrono::steady_clock::now() - t0).count();
+    return draft;
+}
+
 // ---------------------------------------------------------------------------
 // Callback plumbing
 // ---------------------------------------------------------------------------
@@ -205,7 +419,7 @@ struct java_callback {
         jclass cls = e->GetObjectClass(o);
         if (!cls) return false;
         on_token = e->GetMethodID(cls, "onToken", "(Ljava/lang/String;)V");
-        on_done  = e->GetMethodID(cls, "onDone",  "(IJ)V");
+        on_done  = e->GetMethodID(cls, "onDone",  "(IJII)V");
         on_error = e->GetMethodID(cls, "onError", "(Ljava/lang/String;)V");
         e->DeleteLocalRef(cls);
         return on_token && on_done && on_error;
@@ -218,8 +432,11 @@ struct java_callback {
         env->DeleteLocalRef(js);
     }
 
-    void done(int n_tokens, long long elapsed_ms) const {
-        if (on_done) env->CallVoidMethod(obj, on_done, (jint) n_tokens, (jlong) elapsed_ms);
+    void done(int n_tokens, long long elapsed_ms, int drafted, int accepted) const {
+        if (on_done) {
+            env->CallVoidMethod(obj, on_done, (jint) n_tokens, (jlong) elapsed_ms,
+                                (jint) drafted, (jint) accepted);
+        }
     }
 
     void error(const std::string & msg) const {
@@ -307,7 +524,10 @@ std::string token_to_piece(const llama_vocab * vocab, llama_token id) {
 // Feed `tokens` starting at position `pos0`, split into n_batch-sized chunks.
 // llama_decode rejects any batch larger than the context's logical batch size,
 // which is what made long prompts fail with "Failed to process prompt".
-bool decode_tokens(const std::vector<llama_token> & tokens, int pos0, bool logits_on_last) {
+// `logits_on_all` is what speculative decoding needs: every position in the run
+// has to be checkable, not just the final one.
+bool decode_tokens(const std::vector<llama_token> & tokens, int pos0, bool logits_on_last,
+                   bool logits_on_all = false) {
     const int total = (int) tokens.size();
     if (total == 0) return true;
 
@@ -324,7 +544,7 @@ bool decode_tokens(const std::vector<llama_token> & tokens, int pos0, bool logit
             batch.pos[i]       = pos0 + off + i;
             batch.n_seq_id[i]  = 1;
             batch.seq_id[i][0] = 0;
-            batch.logits[i]    = false;
+            batch.logits[i]    = logits_on_all;
         }
         if (logits_on_last && off + n == total) {
             batch.logits[n - 1] = true;
@@ -447,6 +667,58 @@ int count_fastest_cores() {
     return std::clamp(n, 1, cpus);
 }
 
+
+// Brings up the draft context that runs the MTP head.
+//
+// It is a second context over the *same* model -- the weights are shared, only
+// the graph differs -- so the cost is the MTP block plus its own small state,
+// not another copy of the model.
+//
+// Failure here is not fatal: MTP is an optimisation, and a model without a
+// usable nextn block simply generates the ordinary way.
+void setup_mtp_locked(int draft, const llama_context_params & base) {
+    g_ctx_mtp = nullptr;
+    g_mtp_draft = 0;
+
+    const int n_layer_nextn = (int) llama_model_n_layer_nextn(g_model);
+    if (n_layer_nextn <= 0) {
+        LOGI("model has no MTP block, speculative decoding disabled");
+        return;
+    }
+
+    llama_context_params mparams = base;
+    mparams.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+    mparams.ctx_other = g_ctx;
+    // The draft head never needs to rewind: rejected drafts are dropped whole.
+    mparams.n_rs_seq  = 0;
+    mparams.embeddings = false;
+
+    g_ctx_mtp = llama_init_from_model(g_model, mparams);
+    if (!g_ctx_mtp) {
+        LOGW("could not create the MTP draft context, falling back to plain decoding");
+        return;
+    }
+
+    g_mtp_n_embd = (int) llama_model_n_embd_out(g_model);
+    if (g_mtp_n_embd <= 0) {
+        LOGW("MTP hidden width is %d, disabling", g_mtp_n_embd);
+        llama_free(g_ctx_mtp);
+        g_ctx_mtp = nullptr;
+        return;
+    }
+
+    // The target has to publish the hidden state that feeds the MTP head, and
+    // the draft context has to consume it.
+    llama_set_embeddings_nextn(g_ctx,     true, /*masked=*/ false);
+    llama_set_embeddings_nextn(g_ctx_mtp, true, /*masked=*/ true);
+
+    g_mtp_draft = draft;
+    g_mtp_pending_h.assign((size_t) g_mtp_n_embd, 0.0f);
+
+    LOGI("MTP enabled: draft=%d nextn_layers=%d n_embd=%d n_rs_seq=%d",
+         draft, n_layer_nextn, g_mtp_n_embd, (int) base.n_rs_seq);
+}
+
 void ggml_log_to_logcat(ggml_log_level level, const char * text, void *) {
     if (level == GGML_LOG_LEVEL_ERROR) {
         LOGE("%s", text);
@@ -476,7 +748,8 @@ extern "C" {
 
 JNIEXPORT jstring JNICALL
 Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
-        JNIEnv * env, jclass, jstring jpath, jint threads, jint ctxSize, jint gpuLayers) {
+        JNIEnv * env, jclass, jstring jpath, jint threads, jint ctxSize, jint gpuLayers,
+        jint mtpDraft) {
 
     const std::string path = jstring_to_utf8(env, jpath);
 
@@ -484,10 +757,15 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
 
     // Loading a second model used to overwrite the globals and leak the first.
     if (g_sampler) { llama_sampler_free(g_sampler); g_sampler = nullptr; }
+    if (g_ctx_mtp) { llama_free(g_ctx_mtp);         g_ctx_mtp = nullptr; }
     if (g_ctx)     { llama_free(g_ctx);             g_ctx     = nullptr; }
     if (g_model)   { llama_model_free(g_model);     g_model   = nullptr; }
     g_model_loaded.store(false);
     g_cached_tokens.clear();
+    g_mtp_draft = 0;
+    g_mtp_pending_h.clear();
+    g_mtp_verify_h.clear();
+    g_mtp_verify_rows = 0;
 
     llama_backend_init();
     llama_log_set(ggml_log_to_logcat, nullptr);
@@ -504,9 +782,8 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
     // MMAP without MLOCK is deliberate: pinning a multi-gigabyte model gets the
     // app killed by Android's low-memory killer on most phones.
     mparams.load_mode    = LLAMA_LOAD_MODE_MMAP;
-    // MTP layers (blk.N.nextn.*) only serve speculative decoding, which this
-    // app does not do. Skipping them saves memory on models that ship one.
-    mparams.load_mtp     = false;
+    // The MTP block is only worth its memory when we are going to draft with it.
+    mparams.load_mtp     = mtpDraft > 0;
 
     LOGI("loading model: %s (threads=%d ctx=%d gpu_layers=%d)",
          path.c_str(), n_threads, (int) ctxSize, (int) gpuLayers);
@@ -563,12 +840,24 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
     // backend actually support it. The old code logged the flag and did nothing.
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    // Rejecting a drafted token means rewinding the model's state by up to
+    // mtpDraft positions. Attention caches rewind for free, but a recurrent or
+    // hybrid model carries one rolling state and can only step back through
+    // snapshots it was told to keep. Each snapshot costs memory, which is why
+    // this is sized to the draft depth and left at zero when MTP is off.
+    const int mtp_requested = std::max(0, (int) mtpDraft);
+    cparams.n_rs_seq = (uint32_t) mtp_requested;
+
     g_ctx = llama_init_from_model(g_model, cparams);
     if (!g_ctx) {
         llama_model_free(g_model);
         g_model = nullptr;
         return utf8_to_jstring(env,
             "E_CONTEXT|Not enough memory to open this model. Try a smaller model or a shorter context.");
+    }
+
+    if (mtp_requested > 0) {
+        setup_mtp_locked(mtp_requested, cparams);
     }
 
     rebuild_sampler_locked();
@@ -646,6 +935,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeResetSession(JNIEnv *, jclass) {
     std::lock_guard<std::mutex> guard(g_lock);
     if (g_ctx)     llama_memory_clear(llama_get_memory(g_ctx), true);
     if (g_sampler) llama_sampler_reset(g_sampler);
+    mtp_reset_locked();
     g_cached_tokens.clear();
 }
 
@@ -657,6 +947,30 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeStop(JNIEnv *, jclass) {
 // Formats `roles`/`contents` with the model's own chat template and returns the
 // prompt string. Exposed separately so the UI can measure the prompt before
 // committing to a turn.
+
+// Parameter count of the loaded model, used to decide whether MTP fits.
+JNIEXPORT jlong JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeModelParams(JNIEnv *, jclass) {
+    if (!g_model_loaded.load()) return 0;
+    std::lock_guard<std::mutex> guard(g_lock);
+    return g_model ? (jlong) llama_model_n_params(g_model) : 0;
+}
+
+// Whether the loaded model ships an MTP block at all, regardless of whether we
+// asked for it. Lets the UI say "unavailable" instead of silently disabling.
+JNIEXPORT jboolean JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeHasMtpBlock(JNIEnv *, jclass) {
+    if (!g_model_loaded.load()) return JNI_FALSE;
+    std::lock_guard<std::mutex> guard(g_lock);
+    return (g_model && llama_model_n_layer_nextn(g_model) > 0) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeMtpDraft(JNIEnv *, jclass) {
+    if (!g_model_loaded.load()) return 0;
+    std::lock_guard<std::mutex> guard(g_lock);
+    return (jint) (g_ctx_mtp ? g_mtp_draft : 0);
+}
 
 JNIEXPORT jboolean JNICALL
 Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeSupportsThinking(JNIEnv *, jclass) {
@@ -811,11 +1125,14 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
         if (!llama_memory_seq_rm(mem, 0, (llama_pos) common, -1)) {
             LOGI("partial cache eviction unsupported for this model, reprocessing from scratch");
             common = 0;
+        } else if (g_ctx_mtp) {
+            llama_memory_seq_rm(llama_get_memory(g_ctx_mtp), 0, (llama_pos) common, -1);
         }
     }
 
     if (common == 0) {
         llama_memory_clear(mem, true);
+        mtp_reset_locked();
     }
 
     const std::vector<llama_token> tail(tokens.begin() + (long) common, tokens.end());
@@ -823,6 +1140,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
 
     if (!decode_tokens(tail, (int) common, /*logits_on_last=*/true)) {
         llama_memory_clear(mem, true);
+        mtp_reset_locked();
         g_cached_tokens.clear();
         g_generating.store(false);
         cb.error("E_DECODE|Failed to process the prompt.");
@@ -838,21 +1156,35 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
         llama_sampler_accept(g_sampler, t);
     }
 
+    g_mtp_ms_draft  = 0.0;
+    g_mtp_ms_target = 0.0;
+    g_mtp_ms_follow = 0.0;
+
     std::string pending;      // bytes held back as an incomplete UTF-8 sequence
     int         n_generated = 0;
     int         n_past      = (int) tokens.size();
 
-    while (n_generated < (int) maxTokens) {
-        if (g_stop_requested.load()) break;
-
-        const llama_token id = llama_sampler_sample(g_sampler, g_ctx, -1);
-        if (id < 0) {
-            LOGE("sampler returned an invalid token");
-            break;
+    const bool speculative = g_ctx_mtp != nullptr && g_mtp_draft > 0;
+    if (speculative) {
+        // Mirror the prompt into the draft head so it starts from the same state.
+        if (!mtp_follow_target(tail, (int) common)) {
+            LOGW("MTP could not follow the prompt, generating without it");
         }
+    }
+
+    // Emits one token and folds it into every piece of state that tracks the
+    // conversation. Shared by both paths so they cannot drift apart.
+    int  n_drafted  = 0;
+    int  n_accepted = 0;
+    bool stop       = false;
+
+    auto emit = [&](llama_token id) {
         llama_sampler_accept(g_sampler, id);
 
-        if (llama_vocab_is_eog(vocab, id)) break;
+        if (llama_vocab_is_eog(vocab, id)) {
+            stop = true;
+            return;
+        }
 
         pending += token_to_piece(vocab, id);
         const size_t safe = utf8_safe_len(pending);
@@ -863,18 +1195,122 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
 
         g_cached_tokens.push_back(id);
         ++n_generated;
+    };
+
+    llama_token id = llama_sampler_sample(g_sampler, g_ctx, -1);
+
+    while (!stop && n_generated < (int) maxTokens) {
+        if (g_stop_requested.load()) break;
+
+        if (id < 0) {
+            LOGE("sampler returned an invalid token");
+            break;
+        }
+
+        emit(id);
+        if (stop || n_generated >= (int) maxTokens) break;
 
         if (n_past >= n_ctx - 1) {
             LOGW("context window exhausted after %d generated tokens", n_generated);
             break;
         }
 
-        const std::vector<llama_token> one{id};
-        if (!decode_tokens(one, n_past, /*logits_on_last=*/true)) {
-            LOGE("decode failed at position %d", n_past);
+        // --- plain path: one token in, one token out --------------------------
+        if (!speculative) {
+            const std::vector<llama_token> one{id};
+            if (!decode_tokens(one, n_past, /*logits_on_last=*/true)) {
+                LOGE("decode failed at position %d", n_past);
+                break;
+            }
+            ++n_past;
+            id = llama_sampler_sample(g_sampler, g_ctx, -1);
+            continue;
+        }
+
+        // --- speculative path -------------------------------------------------
+        //
+        // The draft head guesses what follows `id`; the target then checks the
+        // whole run in one pass. Whatever it agrees with is free -- those tokens
+        // cost no extra reading of the weights, which is the entire point.
+        std::vector<llama_token> draft = mtp_draft_tokens(id, n_past);
+
+        // Never run past the context window with a speculative tail.
+        while (!draft.empty() && n_past + 1 + (int) draft.size() >= n_ctx - 1) {
+            draft.pop_back();
+        }
+
+        std::vector<llama_token> run;
+        run.reserve(draft.size() + 1);
+        run.push_back(id);
+        run.insert(run.end(), draft.begin(), draft.end());
+
+        const auto t_verify = std::chrono::steady_clock::now();
+        if (!decode_tokens(run, n_past, /*logits_on_last=*/false, /*logits_on_all=*/true)) {
+            LOGE("speculative decode failed at position %d", n_past);
             break;
         }
-        ++n_past;
+        g_mtp_ms_target += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            std::chrono::steady_clock::now() - t_verify).count();
+        mtp_follow_target(run, n_past);
+        n_drafted += (int) draft.size();
+
+        // Walk the guesses. Row j holds the distribution for the token that
+        // follows run[j], so row j is what confirms or replaces draft[j].
+        int accepted = 0;
+        llama_token next = -1;
+
+        // Diagnostic for the first round of a reply: whether the draft head is
+        // producing plausible continuations that merely disagree, or unrelated
+        // tokens. The two mean very different things, and an acceptance
+        // percentage alone cannot tell them apart.
+        const bool trace = (n_generated <= 1);
+        if (trace && !draft.empty()) {
+            std::string line;
+            for (llama_token d : draft) line += "'" + token_to_piece(vocab, d) + "' ";
+            LOGI("MTP draft after '%s': %s", token_to_piece(vocab, id).c_str(), line.c_str());
+        }
+
+        for (size_t j = 0; j <= draft.size(); ++j) {
+            const llama_token sampled = llama_sampler_sample(g_sampler, g_ctx, (int32_t) j);
+
+            if (trace && j < draft.size()) {
+                LOGI("MTP verify[%d]: target='%s' draft='%s' %s", (int) j,
+                     token_to_piece(vocab, sampled).c_str(),
+                     token_to_piece(vocab, draft[j]).c_str(),
+                     sampled == draft[j] ? "MATCH" : "miss");
+            }
+
+            if (j < draft.size() && sampled == draft[j]) {
+                emit(sampled);
+                ++accepted;
+                if (stop || n_generated >= (int) maxTokens) break;
+                continue;
+            }
+
+            // First disagreement: the target's own token wins and everything
+            // after it was predicted from a future that will not happen.
+            next = sampled;
+            break;
+        }
+
+        n_accepted += accepted;
+        n_past += 1 + accepted;
+
+        // Drop the rejected tail so the next decode does not read state that
+        // belongs to tokens the model just discarded.
+        if (accepted < (int) draft.size()) {
+            // Both contexts were fed the whole speculative run, so both have to
+            // forget the part of it that did not survive. Rolling back only the
+            // target leaves the draft head attending to tokens that never
+            // happened -- after which its guesses are worthless, which is
+            // exactly what a near-zero acceptance rate looks like.
+            llama_memory_seq_rm(mem, 0, (llama_pos) n_past, -1);
+            llama_memory_seq_rm(llama_get_memory(g_ctx_mtp), 0, (llama_pos) n_past, -1);
+        }
+        mtp_commit(accepted);
+
+        if (stop || n_generated >= (int) maxTokens) break;
+        id = next;
     }
 
     if (!pending.empty()) {
@@ -886,10 +1322,18 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
 
     LOGI("generated %d tokens in %lld ms (%.2f tok/s)", n_generated, (long long) elapsed,
          elapsed > 0 ? n_generated * 1000.0 / (double) elapsed : 0.0);
+    if (n_drafted > 0) {
+        LOGI("MTP cost: follow=%.0f ms draft=%.0f ms target=%.0f ms -> each draft token costs %.0f%% of a verify",
+             g_mtp_ms_follow, g_mtp_ms_draft, g_mtp_ms_target,
+             g_mtp_ms_target > 0 ? 100.0 * (g_mtp_ms_draft / n_drafted) / (g_mtp_ms_target / (double) (n_drafted / std::max(1, g_mtp_draft) + 1)) : 0.0);
+        // Acceptance is the number that decides whether MTP is worth its memory.
+        LOGI("MTP: drafted=%d accepted=%d (%.0f%%)", n_drafted, n_accepted,
+             100.0 * n_accepted / (double) n_drafted);
+    }
 
     g_stop_requested.store(false);
     g_generating.store(false);
-    cb.done(n_generated, (long long) elapsed);
+    cb.done(n_generated, (long long) elapsed, n_drafted, n_accepted);
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *, void *) {

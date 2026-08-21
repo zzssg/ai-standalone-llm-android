@@ -15,6 +15,18 @@ data class StoredMessage(
     val text: String,
     val tokenCount: Int = 0,
     val elapsedMs: Long = 0,
+    // Speculative-decoding counters. Defaulted so chats written before these
+    // existed still load -- Json is configured to ignore unknown keys, and
+    // defaults cover the other direction.
+    val drafted: Int = 0,
+    val accepted: Int = 0,
+    /**
+     * Whether the prompt left a reasoning block open, so the reply begins as
+     * scratchpad. Stored because it cannot be recovered from the text: a reply
+     * written that way carries a closing tag and no opener, and one stopped
+     * mid-thought carries no tag at all.
+     */
+    val startsInReasoning: Boolean = false,
 )
 
 /** A whole conversation as it sits on disk. */

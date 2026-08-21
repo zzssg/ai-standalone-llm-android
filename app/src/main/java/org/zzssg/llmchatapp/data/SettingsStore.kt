@@ -12,6 +12,8 @@ data class AppSettings(
     val contextSize: Int = 4096,
     /** 0 = let the engine pick from the big-core count. */
     val threads: Int = 0,
+    /** Speculative decoding. AUTO defers to [MtpPolicy]. */
+    val mtp: MtpMode = MtpMode.AUTO,
     val lastModelId: String? = null,
 ) {
     companion object {
@@ -47,6 +49,9 @@ class SettingsStore(context: Context) {
             ),
             contextSize = prefs.getInt(KEY_CONTEXT_SIZE, defaults.contextSize),
             threads = prefs.getInt(KEY_THREADS, defaults.threads),
+            mtp = runCatching {
+                MtpMode.valueOf(prefs.getString(KEY_MTP, null) ?: defaults.mtp.name)
+            }.getOrDefault(defaults.mtp),
             lastModelId = prefs.getString(KEY_LAST_MODEL, null),
         )
     }
@@ -62,6 +67,7 @@ class SettingsStore(context: Context) {
         putString(KEY_THINKING, settings.sampling.thinking.name)
         putInt(KEY_CONTEXT_SIZE, settings.contextSize)
         putInt(KEY_THREADS, settings.threads)
+        putString(KEY_MTP, settings.mtp.name)
         putString(KEY_LAST_MODEL, settings.lastModelId)
     }
 
@@ -76,6 +82,7 @@ class SettingsStore(context: Context) {
         const val KEY_THINKING = "thinking_mode"
         const val KEY_CONTEXT_SIZE = "context_size"
         const val KEY_THREADS = "threads"
+        const val KEY_MTP = "mtp_mode"
         const val KEY_LAST_MODEL = "last_model"
     }
 }

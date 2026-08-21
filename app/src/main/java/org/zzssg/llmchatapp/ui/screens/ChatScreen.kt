@@ -319,16 +319,17 @@ private fun Composer(
                 .imePadding()
                 .padding(horizontal = Spacing.md, vertical = Spacing.sm),
         ) {
-            // Only shown for models that actually reason, so it never appears as a
-            // control that does nothing.
-            if (state.canToggleThinking) {
-                ThinkingChip(
-                    mode = state.settings.sampling.thinking,
-                    enabled = !state.isGenerating,
-                    onChange = onThinkingChange,
-                )
-                Spacer(Modifier.height(Spacing.sm))
-            }
+            // Shown for every model, disabled for the ones that cannot reason.
+            // Hiding it made the control appear and disappear as models were
+            // switched, which reads as a bug; a greyed chip that says why is
+            // both steadier and more informative.
+            ThinkingChip(
+                mode = state.settings.sampling.thinking,
+                supported = state.canToggleThinking,
+                enabled = state.canToggleThinking && !state.isGenerating,
+                onChange = onThinkingChange,
+            )
+            Spacer(Modifier.height(Spacing.sm))
 
             Row(
                 verticalAlignment = Alignment.Bottom,
@@ -386,6 +387,7 @@ private fun Composer(
 @Composable
 private fun ThinkingChip(
     mode: ThinkingMode,
+    supported: Boolean,
     enabled: Boolean,
     onChange: (ThinkingMode) -> Unit,
 ) {
@@ -393,7 +395,10 @@ private fun ThinkingChip(
         horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        val thinkingOn = mode != ThinkingMode.OFF
+        // A model with no <think> block in its template will not reason whatever
+        // the setting says, so the chip reads as off rather than showing a state
+        // the reply will not honour.
+        val thinkingOn = supported && mode != ThinkingMode.OFF
 
         FilterChip(
             selected = thinkingOn,
@@ -410,7 +415,11 @@ private fun ThinkingChip(
         )
 
         Text(
-            text = if (thinkingOn) "Reasons first, slower" else "Answers directly, faster",
+            text = when {
+                !supported -> "This model does not reason"
+                thinkingOn -> "Reasons first, slower"
+                else -> "Answers directly, faster"
+            },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,

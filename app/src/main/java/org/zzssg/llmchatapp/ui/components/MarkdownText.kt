@@ -1,15 +1,21 @@
 package org.zzssg.llmchatapp.ui.components
 
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -32,124 +38,167 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.TextUnit
+import androidx.compose.ui.unit.takeOrElse
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import org.zzssg.llmchatapp.ui.theme.CodeTextStyle
 import org.zzssg.llmchatapp.ui.theme.Spacing
 
 /**
- * Minimal markdown rendering for model output.
+ * Renders a model reply.
  *
- * Deliberately not a full parser: models overwhelmingly emit fenced code blocks,
- * inline code, bold and italic, and those four cover almost everything a chat
- * reply contains. Anything else falls through as plain text, which is still a
- * large improvement over the previous UI, where a code block arrived as an
- * unformatted wall of characters inside a chat bubble.
+ * Models write structured prose -- headings, tables, lists, rules, fenced code --
+ * and showing that as literal `##` and pipe characters makes a competent answer
+ * look like a broken one. Parsing lives in MarkdownBlocks.kt so it can be tested
+ * without a device; this file only draws.
  */
 @Composable
 fun MarkdownText(
     text: String,
     modifier: Modifier = Modifier,
+    startsInReasoning: Boolean = false,
     onCopyCode: (String) -> Unit = {},
 ) {
-    val blocks = remember(text) { splitReasoning(text) }
+    val blocks = remember(text, startsInReasoning) { splitReasoning(text, startsInReasoning) }
 
     Column(modifier, verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
         blocks.forEach { block ->
             when (block) {
                 is MarkdownBlock.Paragraph -> SelectionContainer {
                     Text(
-                        text = renderInline(block.text),
+                        renderInline(block.text, LocalTextStyle.current.mathSize()),
                         style = LocalTextStyle.current,
                     )
                 }
 
+                is MarkdownBlock.Heading -> HeadingBlock(block)
                 is MarkdownBlock.Code -> CodeBlock(block, onCopyCode)
-
+                is MarkdownBlock.Table -> TableBlock(block)
+                is MarkdownBlock.Bullets -> BulletsBlock(block)
+                is MarkdownBlock.Math -> MathBlock(block.latex)
                 is MarkdownBlock.Reasoning -> ReasoningBlock(block)
+
+                MarkdownBlock.Rule -> Spacer(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = Spacing.xs)
+                        .height(1.dp)
+                        .background(MaterialTheme.colorScheme.outlineVariant)
+                )
             }
         }
     }
 }
 
-/**
- * Collapsed by default: the reasoning trace is context for the answer, not the
- * answer. It stays reachable for anyone who wants to see how the model got there.
- */
 @Composable
-private fun ReasoningBlock(block: MarkdownBlock.Reasoning) {
-    var expanded by rememberSaveable(block.text) { mutableStateOf(false) }
+private fun HeadingBlock(block: MarkdownBlock.Heading) {
+    // Chat bubbles are narrow, so headings separate themselves by weight and a
+    // modest step in size rather than the display-scale jumps a document uses.
+    val style = when (block.level) {
+        1 -> MaterialTheme.typography.titleLarge
+        2 -> MaterialTheme.typography.titleMedium
+        else -> MaterialTheme.typography.titleSmall
+    }
 
-    // Expandable as soon as the block is closed, even when the trace came back
-    // empty -- a header that looks the same but does nothing when tapped reads
-    // as a broken control. The expanded state says so explicitly instead.
-    val canExpand = block.complete
+    SelectionContainer {
+        Text(
+            text = renderInline(block.text, style.mathSize()),
+            style = style.copy(fontWeight = FontWeight.SemiBold),
+            modifier = Modifier.padding(top = Spacing.xs),
+        )
+    }
+}
 
-    val rotation by animateFloatAsState(
-        targetValue = if (expanded) 180f else 0f,
-        label = "chevron",
-    )
-
-    Surface(
-        shape = RoundedCornerShape(10.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
-        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(
-            Modifier
-                .then(
-                    if (canExpand) {
-                        Modifier.clickable(
-                            onClickLabel = if (expanded) "Hide reasoning" else "Show reasoning",
-                        ) { expanded = !expanded }
-                    } else {
-                        Modifier
-                    }
-                )
-                .padding(horizontal = Spacing.md, vertical = Spacing.sm)
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = Icons.Outlined.Psychology,
-                    contentDescription = null,
-                    modifier = Modifier.size(16.dp),
-                )
-                Spacer(Modifier.size(Spacing.sm))
+@Composable
+private fun BulletsBlock(block: MarkdownBlock.Bullets) {
+    Column(verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
+        block.items.forEachIndexed { index, item ->
+            Row {
                 Text(
-                    text = if (block.complete) "Reasoning" else "Thinking",
-                    style = MaterialTheme.typography.labelMedium,
-                    modifier = Modifier.weight(1f),
+                    text = if (block.ordered) "${block.start + index}." else "•",
+                    style = LocalTextStyle.current,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    // A fixed gutter keeps text edges aligned however wide the
+                    // marker is.
+                    modifier = Modifier.widthIn(min = 22.dp),
                 )
-                if (canExpand) {
-                    // A chevron is the affordance: without it the header is just
-                    // text and nothing suggests it can be opened.
-                    Icon(
-                        imageVector = Icons.Outlined.ExpandMore,
-                        contentDescription = null,
-                        modifier = Modifier
-                            .size(18.dp)
-                            .rotate(rotation),
+                SelectionContainer {
+                    Text(
+                        renderInline(item, LocalTextStyle.current.mathSize()),
+                        style = LocalTextStyle.current,
                     )
                 }
             }
+        }
+    }
+}
 
-            if (expanded) {
-                Spacer(Modifier.size(Spacing.sm))
-                SelectionContainer {
-                    Text(
-                        text = block.text.ifBlank {
-                            "This model reported no reasoning for this reply."
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        fontStyle = if (block.text.isBlank()) FontStyle.Italic else null,
-                    )
-                }
+private val TABLE_COLUMN_WIDTH = 132.dp
+
+@Composable
+private fun TableBlock(block: MarkdownBlock.Table) {
+    val border = MaterialTheme.colorScheme.outlineVariant
+    val columns = maxOf(block.header.size, block.rows.maxOfOrNull { it.size } ?: 0)
+
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        // Tables are usually wider than a phone. Scrolling the table alone keeps
+        // its columns intact and leaves the transcript scrolling vertically.
+        Column(
+            Modifier
+                .horizontalScroll(rememberScrollState())
+                .padding(Spacing.sm)
+        ) {
+            TableRow(block.header, border, isHeader = true)
+            block.rows.forEach { row ->
+                Spacer(
+                    Modifier
+                        // Cells plus the 1dp separators between them, otherwise
+                        // the rule stops short of the last column.
+                        .width(TABLE_COLUMN_WIDTH * columns + 1.dp * (columns - 1))
+                        .height(1.dp)
+                        .background(border)
+                )
+                TableRow(row, border, isHeader = false)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TableRow(cells: List<String>, border: Color, isHeader: Boolean) {
+    Row(Modifier.height(IntrinsicSize.Min)) {
+        cells.forEachIndexed { index, cell ->
+            if (index > 0) {
+                Spacer(
+                    Modifier
+                        .width(1.dp)
+                        .fillMaxHeight()
+                        .background(border)
+                )
+            }
+            SelectionContainer {
+                Text(
+                    text = renderInline(cell, MaterialTheme.typography.bodySmall.mathSize()),
+                    style = MaterialTheme.typography.bodySmall.copy(
+                        fontWeight = if (isHeader) FontWeight.SemiBold else FontWeight.Normal,
+                    ),
+                    modifier = Modifier
+                        .width(TABLE_COLUMN_WIDTH)
+                        .padding(horizontal = Spacing.sm, vertical = Spacing.xs),
+                )
             }
         }
     }
@@ -176,10 +225,7 @@ private fun CodeBlock(block: MarkdownBlock.Code, onCopy: (String) -> Unit) {
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                IconButton(
-                    onClick = { onCopy(block.code) },
-                    modifier = Modifier.size(32.dp),
-                ) {
+                IconButton(onClick = { onCopy(block.code) }, modifier = Modifier.size(32.dp)) {
                     Icon(
                         imageVector = Icons.Outlined.ContentCopy,
                         contentDescription = "Copy code",
@@ -191,7 +237,7 @@ private fun CodeBlock(block: MarkdownBlock.Code, onCopy: (String) -> Unit) {
                 Text(
                     text = block.code,
                     style = CodeTextStyle,
-                    // Code must scroll rather than wrap: rewrapped source is
+                    // Code scrolls rather than wraps: rewrapped source is
                     // unreadable and misleading about indentation.
                     modifier = Modifier
                         .horizontalScroll(rememberScrollState())
@@ -202,121 +248,110 @@ private fun CodeBlock(block: MarkdownBlock.Code, onCopy: (String) -> Unit) {
     }
 }
 
-internal sealed interface MarkdownBlock {
-    data class Paragraph(val text: String) : MarkdownBlock
-    data class Code(val language: String, val code: String) : MarkdownBlock
+/**
+ * Collapsed by default: the reasoning trace is context for the answer, not the
+ * answer. It stays reachable for anyone who wants to see how the model got there.
+ */
+@Composable
+private fun ReasoningBlock(block: MarkdownBlock.Reasoning) {
+    // Open while the model is still thinking, closed once it has answered:
+    // watching the reasoning arrive is the interesting part, re-reading it after
+    // the answer is there rarely is. Keyed on completeness rather than on the
+    // text so a collapse the reader chose survives the next token, and so the
+    // block folds itself away exactly once, when the answer starts.
+    var expanded by rememberSaveable(block.complete) { mutableStateOf(!block.complete) }
+    val rotation by animateFloatAsState(if (expanded) 180f else 0f, label = "chevron")
 
-    /**
-     * A reasoning model's `<think>` block. [complete] is false while the closing
-     * tag has not arrived yet, which is how the UI knows to say "Thinking" rather
-     * than offering the finished trace.
-     */
-    data class Reasoning(val text: String, val complete: Boolean) : MarkdownBlock
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            Modifier
+                .clickable(
+                    onClickLabel = if (expanded) "Hide reasoning" else "Show reasoning",
+                ) { expanded = !expanded }
+                .padding(horizontal = Spacing.md, vertical = Spacing.sm)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Outlined.Psychology,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer(Modifier.size(Spacing.sm))
+                Text(
+                    text = if (block.complete) "Reasoning" else "Thinking",
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.weight(1f),
+                )
+                Icon(
+                    imageVector = Icons.Outlined.ExpandMore,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .size(18.dp)
+                        .rotate(rotation),
+                )
+            }
+
+            if (expanded) {
+                Spacer(Modifier.size(Spacing.sm))
+                SelectionContainer {
+                    Text(
+                        // Only reachable while streaming: a finished block with
+                        // nothing in it is dropped by the parser.
+                        text = block.text.ifBlank { "Working through the question..." },
+                        style = MaterialTheme.typography.bodySmall,
+                        fontStyle = if (block.text.isBlank()) FontStyle.Italic else null,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
 }
 
-const val THINK_OPEN = "<think>"
-const val THINK_CLOSE = "</think>"
+/**
+ * The size scripts are scaled against. Text styles do not always carry one, and
+ * a superscript computed from an unspecified size comes out unspecified too.
+ */
+private fun TextStyle.mathSize(): TextUnit = fontSize.takeOrElse { DefaultMathFontSize }
 
 /**
- * Splits `<think>...</think>` out of [text] before anything else runs.
+ * Applies the inline spans: bold, italic, code, and formulas.
  *
- * Reasoning models put their scratchpad inline with the answer. Rendering it as
- * ordinary prose buries the actual reply -- on a short answer the trace can be
- * the entire visible message.
+ * Maths is split out first because its delimiters are not markdown and its
+ * content must not be read as markdown -- a subscript is written with an
+ * underscore, which the emphasis rules would otherwise eat.
  */
-internal fun splitReasoning(text: String): List<MarkdownBlock> {
-    if (!text.contains(THINK_OPEN)) return parseProse(text)
-
-    val blocks = mutableListOf<MarkdownBlock>()
-    var index = 0
-
-    while (index < text.length) {
-        val open = text.indexOf(THINK_OPEN, index)
-        if (open < 0) {
-            blocks += parseProse(text.substring(index).trim())
-            break
-        }
-
-        // Whitespace adjacent to a think block is a separator, not content.
-        // Without trimming, the answer arrives with the blank lines that
-        // followed the closing tag still attached to it.
-        blocks += parseProse(text.substring(index, open).trim())
-
-        val bodyStart = open + THINK_OPEN.length
-        val close = text.indexOf(THINK_CLOSE, bodyStart)
-        if (close < 0) {
-            // Still streaming: everything after the open tag is reasoning so far.
-            blocks += MarkdownBlock.Reasoning(text.substring(bodyStart).trim(), complete = false)
-            break
-        }
-
-        blocks += MarkdownBlock.Reasoning(text.substring(bodyStart, close).trim(), complete = true)
-        index = close + THINK_CLOSE.length
-    }
-
-    return blocks
-}
-
-/**
- * Splits on ``` fences. An unterminated fence is treated as a code block that is
- * still streaming in, so a block does not flicker between plain and formatted
- * while tokens arrive.
- */
-private fun parseProse(text: String): List<MarkdownBlock> {
-    if (!text.contains("```")) {
-        return if (text.isEmpty()) emptyList() else listOf(MarkdownBlock.Paragraph(text))
-    }
-
-    val blocks = mutableListOf<MarkdownBlock>()
-    val lines = text.lines()
-    var index = 0
-
-    while (index < lines.size) {
-        val line = lines[index]
-        if (line.trimStart().startsWith("```")) {
-            val language = line.trimStart().removePrefix("```").trim()
-            val code = StringBuilder()
-            index++
-            while (index < lines.size && !lines[index].trimStart().startsWith("```")) {
-                if (code.isNotEmpty()) code.append('\n')
-                code.append(lines[index])
-                index++
+internal fun renderInline(text: String, fontSize: TextUnit = DefaultMathFontSize): AnnotatedString =
+    buildAnnotatedString {
+        splitInlineMath(text).forEach { chunk ->
+            when (chunk) {
+                is InlineChunk.Formula -> appendInlineMath(chunk.latex, fontSize)
+                is InlineChunk.Text -> appendMarkdown(chunk.text)
             }
-            index++ // consume the closing fence, if present
-            blocks += MarkdownBlock.Code(language, code.toString())
-        } else {
-            val paragraph = StringBuilder()
-            while (index < lines.size && !lines[index].trimStart().startsWith("```")) {
-                if (paragraph.isNotEmpty()) paragraph.append('\n')
-                paragraph.append(lines[index])
-                index++
-            }
-            val content = paragraph.toString().trim('\n')
-            if (content.isNotBlank()) blocks += MarkdownBlock.Paragraph(content)
         }
     }
 
-    return blocks
-}
-
-/** Applies `**bold**`, `*italic*` and `` `code` `` spans. */
-private fun renderInline(text: String): AnnotatedString = buildAnnotatedString {
+/** Bold, italic and code spans, on text already known to be free of maths. */
+private fun AnnotatedString.Builder.appendMarkdown(text: String) {
     var i = 0
     while (i < text.length) {
         when {
             text.startsWith("**", i) -> {
                 val end = text.indexOf("**", i + 2)
-                if (end < 0) { append(text.substring(i)); return@buildAnnotatedString }
-                withSpan(SpanStyle(fontWeight = FontWeight.Bold)) {
-                    append(text.substring(i + 2, end))
-                }
+                if (end < 0) { append(text.substring(i)); return }
+                withSpan(SpanStyle(fontWeight = FontWeight.Bold)) { append(text.substring(i + 2, end)) }
                 i = end + 2
             }
 
             text[i] == '`' -> {
                 val end = text.indexOf('`', i + 1)
-                if (end < 0) { append(text.substring(i)); return@buildAnnotatedString }
-                withSpan(SpanStyle(fontFamily = FontFamily.Monospace)) {
+                if (end < 0) { append(text.substring(i)); return }
+                withSpan(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
                     append(text.substring(i + 1, end))
                 }
                 i = end + 1
@@ -324,15 +359,12 @@ private fun renderInline(text: String): AnnotatedString = buildAnnotatedString {
 
             text[i] == '*' -> {
                 val end = text.indexOf('*', i + 1)
-                if (end < 0) { append(text.substring(i)); return@buildAnnotatedString }
-                withSpan(SpanStyle(fontStyle = FontStyle.Italic)) {
-                    append(text.substring(i + 1, end))
-                }
+                if (end < 0) { append(text.substring(i)); return }
+                withSpan(SpanStyle(fontStyle = FontStyle.Italic)) { append(text.substring(i + 1, end)) }
                 i = end + 1
             }
 
             else -> {
-                // Copy through to the next character that could start a span.
                 val next = text.indexOfAny(charArrayOf('*', '`'), i + 1)
                 val stop = if (next < 0) text.length else next
                 append(text.substring(i, stop))
@@ -342,9 +374,9 @@ private fun renderInline(text: String): AnnotatedString = buildAnnotatedString {
     }
 }
 
-private inline fun androidx.compose.ui.text.AnnotatedString.Builder.withSpan(
+private inline fun AnnotatedString.Builder.withSpan(
     style: SpanStyle,
-    block: androidx.compose.ui.text.AnnotatedString.Builder.() -> Unit,
+    block: AnnotatedString.Builder.() -> Unit,
 ) {
     val start = length
     block()

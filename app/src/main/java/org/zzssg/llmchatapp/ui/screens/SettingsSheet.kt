@@ -20,6 +20,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.outlined.Tune
@@ -44,6 +45,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -52,6 +54,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import org.zzssg.llmchatapp.data.AppSettings
+import org.zzssg.llmchatapp.data.MtpDecision
+import org.zzssg.llmchatapp.data.MtpMode
 import org.zzssg.llmchatapp.llm.SamplingConfig
 import org.zzssg.llmchatapp.llm.ThinkingMode
 import org.zzssg.llmchatapp.ui.theme.MinTouchTarget
@@ -72,6 +76,7 @@ import kotlin.math.roundToInt
 fun SettingsSheet(
     settings: AppSettings,
     canToggleThinking: Boolean,
+    mtpDecision: MtpDecision?,
     onApply: (AppSettings) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -79,7 +84,9 @@ fun SettingsSheet(
     var draft by remember { mutableStateOf(settings) }
     var showAdvanced by remember { mutableStateOf(false) }
 
-    val needsReload = draft.contextSize != settings.contextSize || draft.threads != settings.threads
+    // Any change reopens the model, so the notice and the button follow whether
+    // anything changed at all rather than trying to guess which knobs are cheap.
+    val hasChanges = draft != settings
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
         Column(
@@ -107,19 +114,26 @@ fun SettingsSheet(
                     maxLines = 6,
                 )
 
-                if (canToggleThinking) {
-                    Spacer(Modifier.height(Spacing.md))
-                    SettingLabel(
-                        title = "Reasoning",
-                        description = "Reasoning models can work through a problem before " +
-                            "answering. It costs time and tokens on every reply.",
-                    )
-                    Spacer(Modifier.height(Spacing.sm))
-                    ThinkingSelector(
-                        mode = draft.sampling.thinking,
-                        onChange = { draft = draft.withSampling { copy(thinking = it) } },
-                    )
-                }
+                Spacer(Modifier.height(Spacing.md))
+                SettingLabel(
+                    title = "Reasoning",
+                    // The setting is kept and greyed rather than hidden: it is a
+                    // preference about models in general, so a reasoning model
+                    // loaded later should find the choice where it was left.
+                    description = if (canToggleThinking) {
+                        "Reasoning models can work through a problem before answering. " +
+                            "It costs time and tokens on every reply."
+                    } else {
+                        "The model in use has no reasoning block in its chat template, " +
+                            "so this has no effect until a reasoning model is loaded."
+                    },
+                )
+                Spacer(Modifier.height(Spacing.sm))
+                ThinkingSelector(
+                    mode = draft.sampling.thinking,
+                    enabled = canToggleThinking,
+                    onChange = { draft = draft.withSampling { copy(thinking = it) } },
+                )
             }
 
             // -- Output shape -------------------------------------------------
@@ -207,9 +221,23 @@ fun SettingsSheet(
                     onChange = { draft = draft.copy(threads = it.roundToInt()) },
                 )
 
+                Spacer(Modifier.height(Spacing.md))
+                SettingLabel(
+                    title = "Speculative decoding",
+                    description = "A small extra head guesses the next few tokens and the " +
+                        "model confirms them in one pass. Faster, but it holds about " +
+                        "700 MB more memory.",
+                )
+                Spacer(Modifier.height(Spacing.sm))
+                MtpSelector(
+                    mode = draft.mtp,
+                    onChange = { draft = draft.copy(mtp = it) },
+                )
+                mtpDecision?.let { DecisionNote(it) }
+
                 // Only shown once a reload is actually pending, so it reads as a
                 // consequence of what was just changed rather than a standing warning.
-                AnimatedVisibility(visible = needsReload) {
+                AnimatedVisibility(visible = hasChanges) {
                     ReloadNotice()
                 }
             }
@@ -227,11 +255,12 @@ fun SettingsSheet(
                         onApply(draft)
                         onDismiss()
                     },
+                    enabled = hasChanges,
                     modifier = Modifier
                         .weight(2f)
                         .heightIn(min = MinTouchTarget),
                     shape = RoundedCornerShape(14.dp),
-                ) { Text(if (needsReload) "Apply and reload" else "Apply") }
+                ) { Text(if (hasChanges) "Apply and reload" else "Apply") }
             }
         }
     }
@@ -268,18 +297,30 @@ private fun SettingsGroup(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ThinkingSelector(mode: ThinkingMode, onChange: (ThinkingMode) -> Unit) {
+private fun ThinkingSelector(
+    mode: ThinkingMode,
+    enabled: Boolean,
+    onChange: (ThinkingMode) -> Unit,
+) {
     val options = listOf(
         ThinkingMode.ON to "Always",
         ThinkingMode.AUTO to "Model default",
         ThinkingMode.OFF to "Never",
     )
 
-    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+    // Material greys only the selected item when a segmented row is disabled,
+    // which leaves the other two looking tappable. Fading the whole row is what
+    // actually reads as unavailable.
+    SingleChoiceSegmentedButtonRow(
+        Modifier
+            .fillMaxWidth()
+            .alpha(if (enabled) 1f else 0.5f)
+    ) {
         options.forEachIndexed { index, (value, label) ->
             SegmentedButton(
                 selected = mode == value,
                 onClick = { onChange(value) },
+                enabled = enabled,
                 shape = SegmentedButtonDefaults.itemShape(index, options.size),
                 icon = {
                     // Default icon slot draws a check; keep it for the selected
@@ -290,6 +331,56 @@ private fun ThinkingSelector(mode: ThinkingMode, onChange: (ThinkingMode) -> Uni
                     Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 },
             )
+        }
+    }
+}
+
+/**
+ * Auto is the default and the honest one: whether speculation pays off depends
+ * on this phone's memory and this model's size, and the app knows both. On and
+ * Off are there for anyone who wants to measure the difference themselves.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MtpSelector(mode: MtpMode, onChange: (MtpMode) -> Unit) {
+    val options = listOf(
+        MtpMode.AUTO to "Auto",
+        MtpMode.ON to "On",
+        MtpMode.OFF to "Off",
+    )
+
+    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+        options.forEachIndexed { index, (value, label) ->
+            SegmentedButton(
+                selected = mode == value,
+                onClick = { onChange(value) },
+                shape = SegmentedButtonDefaults.itemShape(index, options.size),
+                icon = { if (mode == value) SegmentedButtonDefaults.Icon(active = true) },
+                label = { Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            )
+        }
+    }
+}
+
+/** What the policy decided and why, so Auto is not a black box. */
+@Composable
+private fun DecisionNote(decision: MtpDecision) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = Spacing.sm),
+    ) {
+        Row(Modifier.padding(Spacing.md), verticalAlignment = Alignment.Top) {
+            Icon(
+                imageVector = if (decision.enabled) Icons.Outlined.Bolt else Icons.Outlined.Info,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+            )
+            Spacer(Modifier.size(Spacing.sm))
+            Text(decision.reason, style = MaterialTheme.typography.bodySmall)
         }
     }
 }

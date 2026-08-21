@@ -59,6 +59,12 @@ data class LoadedModel(
     val contextSize: Int,
     /** Whether a thinking toggle is meaningful for this model. */
     val supportsThinking: Boolean,
+    /** Draft depth in use for speculative decoding; 0 when not running. */
+    val mtpDraft: Int = 0,
+    /** Parameter count, used to decide whether speculation fits in memory. */
+    val params: Long = 0,
+    /** Whether the model ships a draft head at all. */
+    val hasMtpBlock: Boolean = false,
 )
 
 /** A failure with a stable code, so the UI can react without matching on prose. */
@@ -66,8 +72,23 @@ class LlamaException(val code: String, message: String) : Exception(message)
 
 /** Emitted while a response streams in. */
 sealed interface GenerationEvent {
+    /**
+     * Sent once, before the first token, describing the shape of what follows.
+     *
+     * [insideReasoning] says the prompt handed the model an open `<think>` block,
+     * so the reply starts as scratchpad and the closing tag is the only one that
+     * will arrive. Only the prompt builder knows this, and the UI needs it from
+     * the very first token to show a reasoning block instead of an answer.
+     */
+    data class Started(val insideReasoning: Boolean) : GenerationEvent
+
     data class Token(val text: String) : GenerationEvent
-    data class Done(val tokenCount: Int, val elapsedMs: Long) : GenerationEvent
+    data class Done(
+        val tokenCount: Int,
+        val elapsedMs: Long,
+        val drafted: Int = 0,
+        val accepted: Int = 0,
+    ) : GenerationEvent
 }
 
 /**
@@ -94,13 +115,14 @@ class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
         threads: Int = 0,
         contextSize: Int = 4096,
         gpuLayers: Int = 0,
+        mtpDraft: Int = 0,
     ): LoadedModel = withContext(io) {
         requireAvailable()
         if (!file.isFile) {
             throw LlamaException("E_MISSING", "The model file is no longer on this device.")
         }
 
-        val result = nativeLoadModel(file.absolutePath, threads, contextSize, gpuLayers)
+        val result = nativeLoadModel(file.absolutePath, threads, contextSize, gpuLayers, mtpDraft)
         if (result != "OK") throw result.toLlamaException()
 
         LoadedModel(
@@ -108,6 +130,9 @@ class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
             description = nativeModelDescription(),
             contextSize = nativeContextSize(),
             supportsThinking = nativeSupportsThinking(),
+            mtpDraft = nativeMtpDraft(),
+            params = nativeModelParams(),
+            hasMtpBlock = nativeHasMtpBlock(),
         )
     }
 
@@ -160,13 +185,15 @@ class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
                 throw LlamaException("E_PROMPT", "Could not build a prompt for this model.")
             }
 
+            trySend(GenerationEvent.Started(promptOpensReasoning(prompt)))
+
             val sink = object : TokenSink {
                 override fun onToken(text: String) {
                     trySend(GenerationEvent.Token(text))
                 }
 
-                override fun onDone(tokenCount: Int, elapsedMs: Long) {
-                    trySend(GenerationEvent.Done(tokenCount, elapsedMs))
+                override fun onDone(tokenCount: Int, elapsedMs: Long, drafted: Int, accepted: Int) {
+                    trySend(GenerationEvent.Done(tokenCount, elapsedMs, drafted, accepted))
                     close()
                 }
 

@@ -1,3 +1,9 @@
 <resources>
     <string name="app_name">Local LLM Chat</string>
+
+    <string name="generation_notification_title">Writing a reply</string>
+    <string name="generation_notification_text">The model is running on this device.</string>
+    <string name="generation_notification_stop">Stop</string>
+    <string name="generation_channel_name">Reply in progress</string>
+    <string name="generation_channel_description">Shown while the model is writing an answer, so generation keeps running with the app in the background.</string>
 </resources>

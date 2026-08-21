@@ -32,8 +32,13 @@ interface TokenSink {
     /** A chunk of decoded text. Always a whole number of UTF-8 characters. */
     fun onToken(text: String)
 
-    /** Generation finished normally, was stopped, or hit the token limit. */
-    fun onDone(tokenCount: Int, elapsedMs: Long)
+    /**
+     * Generation finished normally, was stopped, or hit the token limit.
+     *
+     * [drafted] and [accepted] are zero unless speculative decoding ran; their
+     * ratio is what says whether it was worth its memory.
+     */
+    fun onDone(tokenCount: Int, elapsedMs: Long, drafted: Int, accepted: Int)
 
     /** Terminal failure. [message] is `CODE|human readable text`. */
     fun onError(message: String)
@@ -50,6 +55,8 @@ external fun nativeLoadModel(
     threads: Int,
     ctxSize: Int,
     gpuLayers: Int,
+    /** Tokens to draft per step with the MTP head; 0 disables speculative decoding. */
+    mtpDraft: Int,
 ): String
 
 external fun nativeUnloadModel()
@@ -68,6 +75,15 @@ external fun nativeSetSampling(
     repeatPenalty: Float,
     seed: Int,
 )
+
+/** Draft depth actually in use, or 0 when MTP is unavailable or disabled. */
+external fun nativeMtpDraft(): Int
+
+/** Parameter count of the loaded model. */
+external fun nativeModelParams(): Long
+
+/** Whether the model ships an MTP block, whether or not it was loaded. */
+external fun nativeHasMtpBlock(): Boolean
 
 /** True when the loaded model marks its reasoning with `<think>` blocks. */
 external fun nativeSupportsThinking(): Boolean

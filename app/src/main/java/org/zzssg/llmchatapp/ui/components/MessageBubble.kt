@@ -72,7 +72,11 @@ fun MessageBubble(
                 if (message.text.isEmpty() && message.streaming) {
                     TypingIndicator()
                 } else {
-                    MarkdownText(text = message.text, onCopyCode = onCopy)
+                    MarkdownText(
+                        text = message.text,
+                        startsInReasoning = message.startsInReasoning,
+                        onCopyCode = onCopy,
+                    )
                 }
             }
         }
@@ -80,19 +84,29 @@ fun MessageBubble(
         // The footer only appears once a reply is complete, so it never shifts
         // the layout while text is streaming in.
         if (!isUser && !message.streaming && message.text.isNotEmpty()) {
-            MessageFooter(message = message, onCopy = { onCopy(message.text) })
+            // Copies the answer, not the scratchpad: reasoning is shown because
+            // it is interesting to watch, but it is not what the model said.
+            // A reply stopped mid-thought has no answer yet, so there the button
+            // is greyed rather than silently putting an empty string on the
+            // clipboard.
+            val answer = answerOnly(message.text, message.startsInReasoning)
+            MessageFooter(
+                message = message,
+                canCopy = answer.isNotBlank(),
+                onCopy = { onCopy(answer) },
+            )
         }
     }
 }
 
 @Composable
-private fun MessageFooter(message: ChatMessage, onCopy: () -> Unit) {
+private fun MessageFooter(message: ChatMessage, canCopy: Boolean, onCopy: () -> Unit) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(Spacing.xs),
         modifier = Modifier.padding(top = Spacing.xs),
     ) {
-        IconButton(onClick = onCopy, modifier = Modifier.size(32.dp)) {
+        IconButton(onClick = onCopy, enabled = canCopy, modifier = Modifier.size(32.dp)) {
             Icon(
                 imageVector = Icons.Outlined.ContentCopy,
                 contentDescription = "Copy reply",
@@ -104,11 +118,18 @@ private fun MessageFooter(message: ChatMessage, onCopy: () -> Unit) {
             // build appended "[stats] avg_ms=... tps=..." to the reply text
             // itself, so the user read debug output as part of the answer.
             Text(
-                text = "%d tokens · %s · %.1f tok/s".format(
-                    stats.tokenCount,
-                    stats.formattedDuration,
-                    stats.tokensPerSecond,
-                ),
+                text = buildString {
+                    append(
+                        "%d tokens · %s · %.1f tok/s".format(
+                            stats.tokenCount,
+                            stats.formattedDuration,
+                            stats.tokensPerSecond,
+                        )
+                    )
+                    // Only present when speculative decoding ran. It is the number
+                    // that says whether the extra memory paid for itself.
+                    stats.acceptance?.let { append(" · %.0f%% drafted".format(it * 100)) }
+                },
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
