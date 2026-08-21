@@ -41,10 +41,13 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.TextUnit
+import androidx.compose.ui.unit.takeOrElse
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.zzssg.llmchatapp.ui.theme.CodeTextStyle
@@ -71,13 +74,17 @@ fun MarkdownText(
         blocks.forEach { block ->
             when (block) {
                 is MarkdownBlock.Paragraph -> SelectionContainer {
-                    Text(renderInline(block.text), style = LocalTextStyle.current)
+                    Text(
+                        renderInline(block.text, LocalTextStyle.current.mathSize()),
+                        style = LocalTextStyle.current,
+                    )
                 }
 
                 is MarkdownBlock.Heading -> HeadingBlock(block)
                 is MarkdownBlock.Code -> CodeBlock(block, onCopyCode)
                 is MarkdownBlock.Table -> TableBlock(block)
                 is MarkdownBlock.Bullets -> BulletsBlock(block)
+                is MarkdownBlock.Math -> MathBlock(block.latex)
                 is MarkdownBlock.Reasoning -> ReasoningBlock(block)
 
                 MarkdownBlock.Rule -> Spacer(
@@ -104,7 +111,7 @@ private fun HeadingBlock(block: MarkdownBlock.Heading) {
 
     SelectionContainer {
         Text(
-            text = renderInline(block.text),
+            text = renderInline(block.text, style.mathSize()),
             style = style.copy(fontWeight = FontWeight.SemiBold),
             modifier = Modifier.padding(top = Spacing.xs),
         )
@@ -125,7 +132,10 @@ private fun BulletsBlock(block: MarkdownBlock.Bullets) {
                     modifier = Modifier.widthIn(min = 22.dp),
                 )
                 SelectionContainer {
-                    Text(renderInline(item), style = LocalTextStyle.current)
+                    Text(
+                        renderInline(item, LocalTextStyle.current.mathSize()),
+                        style = LocalTextStyle.current,
+                    )
                 }
             }
         }
@@ -181,7 +191,7 @@ private fun TableRow(cells: List<String>, border: Color, isHeader: Boolean) {
             }
             SelectionContainer {
                 Text(
-                    text = renderInline(cell),
+                    text = renderInline(cell, MaterialTheme.typography.bodySmall.mathSize()),
                     style = MaterialTheme.typography.bodySmall.copy(
                         fontWeight = if (isHeader) FontWeight.SemiBold else FontWeight.Normal,
                     ),
@@ -303,21 +313,44 @@ private fun ReasoningBlock(block: MarkdownBlock.Reasoning) {
     }
 }
 
-/** Applies `**bold**`, `*italic*` and `` `code` `` spans. */
-internal fun renderInline(text: String): AnnotatedString = buildAnnotatedString {
+/**
+ * The size scripts are scaled against. Text styles do not always carry one, and
+ * a superscript computed from an unspecified size comes out unspecified too.
+ */
+private fun TextStyle.mathSize(): TextUnit = fontSize.takeOrElse { DefaultMathFontSize }
+
+/**
+ * Applies the inline spans: bold, italic, code, and formulas.
+ *
+ * Maths is split out first because its delimiters are not markdown and its
+ * content must not be read as markdown -- a subscript is written with an
+ * underscore, which the emphasis rules would otherwise eat.
+ */
+internal fun renderInline(text: String, fontSize: TextUnit = DefaultMathFontSize): AnnotatedString =
+    buildAnnotatedString {
+        splitInlineMath(text).forEach { chunk ->
+            when (chunk) {
+                is InlineChunk.Formula -> appendInlineMath(chunk.latex, fontSize)
+                is InlineChunk.Text -> appendMarkdown(chunk.text)
+            }
+        }
+    }
+
+/** Bold, italic and code spans, on text already known to be free of maths. */
+private fun AnnotatedString.Builder.appendMarkdown(text: String) {
     var i = 0
     while (i < text.length) {
         when {
             text.startsWith("**", i) -> {
                 val end = text.indexOf("**", i + 2)
-                if (end < 0) { append(text.substring(i)); return@buildAnnotatedString }
+                if (end < 0) { append(text.substring(i)); return }
                 withSpan(SpanStyle(fontWeight = FontWeight.Bold)) { append(text.substring(i + 2, end)) }
                 i = end + 2
             }
 
             text[i] == '`' -> {
                 val end = text.indexOf('`', i + 1)
-                if (end < 0) { append(text.substring(i)); return@buildAnnotatedString }
+                if (end < 0) { append(text.substring(i)); return }
                 withSpan(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp)) {
                     append(text.substring(i + 1, end))
                 }
@@ -326,7 +359,7 @@ internal fun renderInline(text: String): AnnotatedString = buildAnnotatedString 
 
             text[i] == '*' -> {
                 val end = text.indexOf('*', i + 1)
-                if (end < 0) { append(text.substring(i)); return@buildAnnotatedString }
+                if (end < 0) { append(text.substring(i)); return }
                 withSpan(SpanStyle(fontStyle = FontStyle.Italic)) { append(text.substring(i + 1, end)) }
                 i = end + 1
             }

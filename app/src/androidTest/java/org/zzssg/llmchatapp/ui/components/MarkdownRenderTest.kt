@@ -95,6 +95,39 @@ class MarkdownRenderTest {
         assertTrue("a bitmap should have been produced", file.length() > 0)
     }
 
+    /**
+     * Formulas, next to the prices that made the dollar rules necessary.
+     * Fractions and roots only read correctly in two dimensions, so this is the
+     * one part of the renderer that a unit test genuinely cannot check.
+     */
+    @Test
+    fun rendersFormulas() {
+        compose.setContent {
+            LlmChatTheme(dynamicColor = false) {
+                Surface {
+                    androidx.compose.foundation.layout.Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState())
+                            .padding(16.dp)
+                    ) {
+                        MarkdownText(text = FORMULAS)
+                    }
+                }
+            }
+        }
+        compose.waitForIdle()
+
+        val bitmap = compose.onRoot().captureToImage().asAndroidBitmap()
+        val dir = InstrumentationRegistry.getInstrumentation()
+            .targetContext.getExternalFilesDir(null)
+        val file = File(dir, "markdown-formulas.png")
+        android.util.Log.i("MarkdownRenderTest", "wrote " + file.absolutePath)
+        file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+
+        assertTrue("a bitmap should have been produced", file.length() > 0)
+    }
+
     private companion object {
         /** Trimmed from a real reply, including the pre-filled closing think tag. */
         val SAMPLE = """
@@ -130,6 +163,27 @@ class MarkdownRenderTest {
             The user is asking about income problems. I should work out what kind they mean before answering: it could be hourly rates, salaries, or averages over a period.
 
             Let me lay out the common shapes first, then pick an example that covers more than one of them.
+        """.trimIndent()
+
+        /** Inline maths, display maths, and prices that must stay prices. */
+        val FORMULAS = """
+            Let ${'$'}x${'$'} be the price of the ball. The bat is ${'$'}x + 1.00${'$'} and the pair costs ${'$'}1.10${'$'}, so:
+
+            ${'$'}${'$'}x + (x + 1.00) = 1.10${'$'}${'$'}
+
+            Solving gives ${'$'}2x = 0.10${'$'}, so the ball costs five cents.
+
+            The quadratic form is
+
+            ${'$'}${'$'}x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}${'$'}${'$'}
+
+            A sum set on its own line takes its limits above and below:
+
+            ${'$'}${'$'}\sum_{i=1}^{n} \alpha_i \le \infty${'$'}${'$'}
+
+            Inline, the same sum reads ${'$'}\sum_{i=1}^{n} \alpha_i${'$'} and a fraction reads ${'$'}\frac{a+b}{2}${'$'}.
+
+            A worked rate: earning ${'$'}50/hr for 8 hours pays ${'$'}400, while ${'$'}80/day pays less over the same week.
         """.trimIndent()
     }
 }

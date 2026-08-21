@@ -18,6 +18,9 @@ sealed interface MarkdownBlock {
     data class Bullets(val items: List<String>, val ordered: Boolean, val start: Int = 1) : MarkdownBlock
     data object Rule : MarkdownBlock
 
+    /** Display maths, set on its own line. [latex] is the source between the delimiters. */
+    data class Math(val latex: String) : MarkdownBlock
+
     /**
      * A reasoning model's scratchpad. [complete] is false while the closing tag
      * has not arrived, which is how the UI knows to say "Thinking" rather than
@@ -101,6 +104,8 @@ private fun reasoning(body: String): List<MarkdownBlock> {
     return if (text.isEmpty()) emptyList() else listOf(MarkdownBlock.Reasoning(text, complete = true))
 }
 
+private val MATH_FENCES = setOf("math", "latex", "tex")
+
 private val HEADING = Regex("""^(#{1,6})\s+(.*)$""")
 private val RULE = Regex("""^\s{0,3}([-*_])\s*(\1\s*){2,}$""")
 private val BULLET = Regex("""^\s{0,3}[-*+]\s+(.*)$""")
@@ -131,7 +136,12 @@ internal fun parseProse(text: String): List<MarkdownBlock> {
                     i++
                 }
                 i++ // consume the closing fence, if it arrived
-                blocks += MarkdownBlock.Code(language, code.toString())
+                // A fence labelled as maths is a formula, not a listing.
+                blocks += if (language.lowercase() in MATH_FENCES) {
+                    MarkdownBlock.Math(code.toString().trim())
+                } else {
+                    MarkdownBlock.Code(language, code.toString())
+                }
             }
 
             // Checked before the heading and bullet rules: "---" would otherwise
@@ -184,8 +194,10 @@ internal fun parseProse(text: String): List<MarkdownBlock> {
                     paragraph.append(lines[i])
                     i++
                 }
-                val content = paragraph.toString().trim()
-                if (content.isNotEmpty()) blocks += MarkdownBlock.Paragraph(content)
+                // Display maths is pulled out here rather than in the line loop
+                // above: models write it mid-sentence as often as on a line of
+                // its own, so it has to break a paragraph apart.
+                blocks += splitDisplayMath(paragraph.toString())
             }
         }
     }
