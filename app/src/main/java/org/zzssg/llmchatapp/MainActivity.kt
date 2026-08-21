@@ -34,6 +34,7 @@ import kotlinx.coroutines.launch
 import org.zzssg.llmchatapp.ui.ChatViewModel
 import org.zzssg.llmchatapp.ui.screens.ChatDrawer
 import org.zzssg.llmchatapp.ui.screens.ChatScreen
+import org.zzssg.llmchatapp.ui.screens.ModelGuideSheet
 import org.zzssg.llmchatapp.ui.screens.ModelSheet
 import org.zzssg.llmchatapp.ui.screens.SettingsSheet
 import org.zzssg.llmchatapp.ui.screens.WelcomeScreen
@@ -67,6 +68,7 @@ private fun App(viewModel: ChatViewModel = viewModel()) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     var showModels by rememberSaveable { mutableStateOf(false) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
+    var showModelGuide by rememberSaveable { mutableStateOf(false) }
 
     val picker = rememberLauncherForActivityResult(
         // OpenDocument rather than GetContent: it returns a stable document URI
@@ -153,8 +155,10 @@ private fun App(viewModel: ChatViewModel = viewModel()) {
             modelState = state.modelState,
             nativeAvailable = state.nativeAvailable,
             hasImportedModels = state.models.isNotEmpty(),
+            totalRamBytes = state.totalRamBytes,
             onImport = openPicker,
             onOpenModels = { showModels = true },
+            onOpenGuide = { showModelGuide = true },
         )
     }
 
@@ -164,7 +168,15 @@ private fun App(viewModel: ChatViewModel = viewModel()) {
             onImport = openPicker,
             onActivate = viewModel::activate,
             onDelete = viewModel::deleteModel,
+            onOpenGuide = { showModelGuide = true },
             onDismiss = { showModels = false },
+        )
+    }
+
+    if (showModelGuide) {
+        ModelGuideSheet(
+            totalRamBytes = state.totalRamBytes,
+            onDismiss = { showModelGuide = false },
         )
     }
 

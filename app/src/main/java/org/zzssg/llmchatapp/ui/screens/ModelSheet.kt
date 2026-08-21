@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -18,6 +19,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.HelpOutline
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -57,6 +59,7 @@ fun ModelSheet(
     onImport: () -> Unit,
     onActivate: (ModelFile) -> Unit,
     onDelete: (ModelFile) -> Unit,
+    onOpenGuide: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -69,8 +72,22 @@ fun ModelSheet(
                 .padding(horizontal = Spacing.lg)
                 .padding(bottom = Spacing.lg),
         ) {
-            Text("Models", style = MaterialTheme.typography.titleLarge)
-            Spacer(Modifier.height(Spacing.xs))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "Models",
+                    style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.weight(1f),
+                )
+                // Reachable from here and not only from the first-run screen:
+                // the question "which file do I download" comes back every time
+                // the user goes looking for a better model.
+                IconButton(onClick = onOpenGuide) {
+                    Icon(
+                        imageVector = Icons.Outlined.HelpOutline,
+                        contentDescription = "How to add a model",
+                    )
+                }
+            }
             Text(
                 text = "Stored inside this app. Deleting one frees the space immediately.",
                 style = MaterialTheme.typography.bodySmall,
@@ -98,12 +115,17 @@ fun ModelSheet(
             }
 
             if (state.models.isEmpty() && state.modelState == ModelUiState.Idle) {
-                Text(
-                    text = "Nothing imported yet.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(vertical = Spacing.lg),
-                )
+                Column(Modifier.padding(vertical = Spacing.lg)) {
+                    Text(
+                        text = "Nothing imported yet.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(Spacing.xs))
+                    TextButton(onClick = onOpenGuide, contentPadding = PaddingValues(0.dp)) {
+                        Text("How do I get one?")
+                    }
+                }
             } else {
                 LazyColumn(
                     modifier = Modifier.heightIn(max = 360.dp),

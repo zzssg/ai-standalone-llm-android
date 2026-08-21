@@ -32,6 +32,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import org.zzssg.llmchatapp.data.ModelSizeAdvice
 import org.zzssg.llmchatapp.data.formatBytes
 import org.zzssg.llmchatapp.ui.ModelUiState
 import org.zzssg.llmchatapp.ui.theme.Spacing
@@ -49,8 +50,10 @@ fun WelcomeScreen(
     modelState: ModelUiState,
     nativeAvailable: Boolean,
     hasImportedModels: Boolean,
+    totalRamBytes: Long,
     onImport: () -> Unit,
     onOpenModels: () -> Unit,
+    onOpenGuide: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -125,14 +128,16 @@ fun WelcomeScreen(
                 }
 
                 Spacer(Modifier.height(Spacing.xl))
-                GuidanceCard()
+                GuidanceCard(totalRamBytes, onOpenGuide)
             }
         }
     }
 }
 
 @Composable
-private fun GuidanceCard() {
+private fun GuidanceCard(totalRamBytes: Long, onOpenGuide: () -> Unit) {
+    val maxBytes = ModelSizeAdvice.recommendedMaxBytes(totalRamBytes)
+
     Surface(
         shape = RoundedCornerShape(16.dp),
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
@@ -149,20 +154,35 @@ private fun GuidanceCard() {
             GuidanceRow(
                 icon = Icons.Outlined.Memory,
                 title = "A .gguf model file",
-                body = "Download one on a computer or in your browser, then pick it here. " +
-                    "Instruction-tuned models give the best answers.",
+                body = "Download one in your browser, then pick it here. Names containing " +
+                    "Instruct or Chat are the ones that answer questions.",
             )
             GuidanceRow(
                 icon = Icons.Outlined.Speed,
-                title = "Start small",
-                body = "1-3 B parameter models at Q4 quantisation run comfortably on most " +
-                    "phones. Larger models need 8 GB of RAM or more.",
+                // The number, not the platitude: the old text said 1-3 B suited
+                // most phones, which undersold a 12 GB device and oversold a
+                // 4 GB one. The phone knows its own memory.
+                title = if (maxBytes > 0) "Up to about ${formatBytes(maxBytes)}" else "Start small",
+                body = if (maxBytes > 0) {
+                    "That is what fits on this phone with room for the conversation. " +
+                        "Roughly a ${ModelSizeAdvice.recommendedParameterRange(totalRamBytes)} " +
+                        "model at Q4_K_M."
+                } else {
+                    "A 3B model at Q4_K_M, around 2 GB, is a safe first choice."
+                },
             )
             GuidanceRow(
                 icon = Icons.Outlined.CloudOff,
                 title = "Works offline",
                 body = "Once a model is imported there is no network traffic at all.",
             )
+
+            TextButton(
+                onClick = onOpenGuide,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("How to find and download one")
+            }
         }
     }
 }
