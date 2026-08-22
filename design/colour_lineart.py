@@ -40,8 +40,10 @@ WORK = 700           #: raster resolution the regions are found at
 SEAL = 16            #: dilation that closes the sketchy outline into a silhouette
 TUCK = 3             #: how far a fill runs under the strokes, so no seam shows
 MIN_REGION = 120     #: below this a region is stroke noise, not an area
-EPSILON = 2.5        #: fill simplification, in working pixels
-INK_EPSILON = 3.0    #: stroke simplification, same units
+EPSILON = 3.5        #: fill simplification, in working pixels
+INK_EPSILON = 3.5    #: line-work simplification, same units
+PATH_BUDGET = 780     #: characters per path; lint's VectorPath limit is 800
+INK_WEIGHT = 0        #: extra thickness for the line work, in working pixels
 VIEWPORT = 1200.0    #: the template's own coordinate space, kept
 
 
@@ -66,7 +68,7 @@ HIGHLIGHT = "#F0E6D4"
 #: fails the build instead of producing a differently coloured squirrel.
 SEEDS = [
     ("head and arms", (355, 249), FUR, 83493),
-    ("chest and right arm", (562, 627), CREAM, 32259),
+    ("chest and right arm", (562, 627), FUR, 32259),
     ("lens", (536, 419), GLASS, 26746),
     ("rim", (507, 223), BRASS, 8197),
     ("magnified iris", (469, 347), FUR_DEEP, 3205),
@@ -164,6 +166,52 @@ def _parse(d):
     return subpaths
 
 
+def _contains(outer, inner):
+    """Is inner's first vertex inside outer? Ray casting, good enough here:
+    potrace contours never straddle each other, they nest or stay apart."""
+    x, y = inner[0]
+    hit = False
+    n = len(outer)
+    for i in range(n):
+        x0, y0 = outer[i]
+        x1, y1 = outer[(i + 1) % n]
+        if (y0 > y) != (y1 > y):
+            if x < x0 + (y - y0) / (y1 - y0) * (x1 - x0):
+                hit = not hit
+    return hit
+
+
+def group_nested(subpaths):
+    """Splits a list of contours into the smallest groups that keep holes.
+
+    Subpaths only have to share a path element when one sits inside another --
+    that is what even-odd turns into a hole. Everything else can be its own
+    path, which is what keeps any single path short enough for lint's limit
+    without losing a hollow stroke to a solid blob.
+    """
+    boxes = []
+    for sub in subpaths:
+        xs = [p[0] for p in sub]
+        ys = [p[1] for p in sub]
+        boxes.append((min(xs), min(ys), max(xs), max(ys), (max(xs) - min(xs)) * (max(ys) - min(ys))))
+
+    order = sorted(range(len(subpaths)), key=lambda i: -boxes[i][4])
+    parent = [None] * len(subpaths)
+    for pos, i in enumerate(order):
+        for j in order[:pos]:
+            bi, bj = boxes[i], boxes[j]
+            if bj[0] <= bi[0] and bj[1] <= bi[1] and bj[2] >= bi[2] and bj[3] >= bi[3]:
+                if _contains(subpaths[j], subpaths[i]):
+                    parent[i] = j
+    groups = {}
+    for i in range(len(subpaths)):
+        root = i
+        while parent[root] is not None:
+            root = parent[root]
+        groups.setdefault(root, []).append(subpaths[i])
+    return list(groups.values())
+
+
 def rasterise(strokes, px):
     """Even-odd, because potrace nests a stroke's inner contour to make it hollow."""
     scale = px / VIEWPORT
@@ -250,52 +298,60 @@ def build(svg, px=WORK, tolerate=0.25):
     # fills solid and covers the lens. Keeping regions apart rather than merging
     # a colour into one path keeps each path short.
     layers = []
+    ink_paths = _emit_region(tracer.dilate(ink, INK_WEIGHT) if INK_WEIGHT else ink,
+                             VIEWPORT / px, epsilon=INK_EPSILON)
     for name, (sx, sy), colour, _ in SEEDS:
         idx = labels[int(sy * scale), int(sx * scale)]
         mask = labels == idx
         # Run the fill under the strokes: the region stops at the ink, and a fill
         # that stops there too leaves a pale seam along every line.
         mask = smooth_mask(tracer.dilate(mask, TUCK), passes=2)
-        d = _emit(tracer.contours(mask), VIEWPORT / px)
-        if d:
+        for d in _emit_region(mask, VIEWPORT / px):
             layers.append((colour, [d]))
-    return layers, strokes, report
+    return layers, ink_paths, report
 
 
-def _emit(polys, scale):
-    """All contours of one region as a single path string, holes included."""
-    chunk = []
-    for poly in polys:
-        pts = tracer.simplify(poly, EPSILON)
-        if len(pts) < 3:
-            continue
-        chunk.append(f"M{pts[0][0] * scale:.1f},{pts[0][1] * scale:.1f}")
-        chunk += [f"L{x * scale:.1f},{y * scale:.1f}" for x, y in pts[1:]]
-        chunk.append("Z")
-    return "".join(chunk)
+def _emit_region(mask, scale, budget=PATH_BUDGET, max_bands=24, epsilon=None):
+    """A region as paths, none longer than [budget] characters.
 
-
-def stroke_paths(strokes, epsilon=INK_EPSILON, px=WORK):
-    """The line work, simplified but otherwise as drawn.
-
-    Emitted one element per subpath. The template arrives with every stroke
-    merged into a handful of path elements, the longest fifteen thousand
-    characters, which lint rejects on performance grounds; splitting them costs
-    nothing at draw time and each piece is then well inside the limit.
+    A big fill is one enormous contour, and simplifying it far enough to fit the
+    limit turns the whole silhouette polygonal -- the ears go first. So instead
+    the mask is cut into horizontal bands and each is traced on its own. Bands
+    share their cut line exactly and overlap by a pixel, so they tile back into
+    the same shape with no seam, and each path is a fraction of the length.
     """
-    scale = px / VIEWPORT
-    out = []
-    for group in strokes:
-        chunk = []
-        for sub in group:
-            pts = tracer.simplify([(x * scale, y * scale) for x, y in sub], epsilon)
-            if len(pts) < 3:
+    for bands in range(1, max_bands + 1):
+        height = mask.shape[0]
+        step = height / bands
+        out = []
+        for b in range(bands):
+            lo = int(b * step)
+            hi = height if b == bands - 1 else int((b + 1) * step) + 1
+            slab = np.zeros_like(mask)
+            slab[lo:hi] = mask[lo:hi]
+            if not slab.any():
                 continue
-            chunk.append(f"M{pts[0][0] / scale:.1f},{pts[0][1] / scale:.1f}")
-            chunk += [f"L{x / scale:.1f},{y / scale:.1f}" for x, y in pts[1:]]
+            out += _emit(tracer.contours(slab), scale, epsilon)
+        if not out or max(len(d) for d in out) <= budget:
+            return out
+    return out
+
+
+def _emit(polys, scale, epsilon=None):
+    """A region's contours, grouped only where one sits inside another."""
+    simplified = []
+    for poly in polys:
+        pts = tracer.simplify(poly, EPSILON if epsilon is None else epsilon)
+        if len(pts) >= 3:
+            simplified.append(pts)
+    out = []
+    for group in group_nested(simplified):
+        chunk = []
+        for pts in group:
+            chunk.append(f"M{pts[0][0] * scale:.1f},{pts[0][1] * scale:.1f}")
+            chunk += [f"L{x * scale:.1f},{y * scale:.1f}" for x, y in pts[1:]]
             chunk.append("Z")
-        if chunk:
-            out.append("".join(chunk))
+        out.append("".join(chunk))
     return out
 
 
@@ -334,16 +390,12 @@ def to_vector_drawable(layers, inks, size=108, viewport=VIEWPORT, crop=None):
         "    Generated by design/colour_lineart.py from the line-art template and\n"
         "    the painting's palette. Regenerate rather than editing by hand.\n"
         "\n"
-        "    VectorPath is suppressed deliberately. It wants no path longer than\n"
-        "    800 characters; the longest here is about 1600, and the whole drawing\n"
-        "    is 91 paths and 12 KB, which is not the runaway single path the check\n"
-        "    exists to catch. Simplifying until it passed was tried and measured:\n"
-        "    the fur ticks and the face detail go before the limit is reached, and\n"
-        "    the drawing stops being the drawing.\n"
+        "    Every path stays under the 800 characters lint asks for, by cutting\n"
+        "    the large areas into horizontal bands rather than by simplifying them\n"
+        "    until they fit. Bands share their cut line exactly, so they tile back\n"
+        "    into one shape, and the ears stay round instead of going polygonal.\n"
         "-->\n"
         '<vector xmlns:android="http://schemas.android.com/apk/res/android"\n'
-        '    xmlns:tools="http://schemas.android.com/tools"\n'
-        '    tools:ignore="VectorPath"\n'
         f'    android:width="{size}dp"\n'
         f'    android:height="{size}dp"\n'
         f'    android:viewportWidth="{viewport:.0f}"\n'
@@ -492,8 +544,7 @@ def launcher_foreground(layers, inks, crop_box, safe=0.62):
 
 if __name__ == "__main__":
     svg = sys.argv[1]
-    layers, strokes, report = build(svg)
-    inks = stroke_paths(strokes)
+    layers, inks, report = build(svg)
 
     if "--launcher" in sys.argv:
         box = launcher_crop(svg)
