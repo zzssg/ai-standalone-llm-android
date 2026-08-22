@@ -81,6 +81,9 @@ import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.draw.scale
 import org.zzssg.llmchatapp.ui.components.MascotBadge
 import org.zzssg.llmchatapp.ui.theme.Spacing
@@ -317,10 +320,24 @@ private fun Composer(
     onSend: () -> Unit,
     onStop: () -> Unit,
 ) {
-    Surface(tonalElevation = 3.dp) {
+    val divider = MaterialTheme.colorScheme.outlineVariant
+    val hairline = with(LocalDensity.current) { 1.dp.toPx() }
+
+    // Flat rather than tonal: elevation tint turned the whole composer into a
+    // peach slab across the bottom of the screen, which is most of what made
+    // the app read as beige. A hairline does the separating instead.
+    Surface(color = MaterialTheme.colorScheme.surface) {
         Column(
             Modifier
                 .fillMaxWidth()
+                .drawBehind {
+                    drawLine(
+                        color = divider,
+                        start = Offset(0f, 0f),
+                        end = Offset(size.width, 0f),
+                        strokeWidth = hairline,
+                    )
+                }
                 .navigationBarsPadding()
                 .imePadding()
                 .padding(horizontal = Spacing.md, vertical = Spacing.sm),

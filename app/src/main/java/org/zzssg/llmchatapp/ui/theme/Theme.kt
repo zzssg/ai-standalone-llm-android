@@ -33,9 +33,9 @@ import androidx.compose.ui.unit.sp
  * at 2.8:1 and failed.
  */
 
-/** Squirrel fur. Every primary action in the app is this colour. */
-private val FurOrange = Color(0xFFEA6A0A)
-private val FurInk = Color(0xFF2B1A10)
+/** Squirrel fur, the same value the mascot is drawn in. */
+private val FurOrange = Color(0xFFF2711C)
+private val FurInk = Color(0xFF2E1B10)
 
 /** The lens: what the app has figured out -- reasoning, model info, stats. */
 private val LensTeal = Color(0xFF0F7C96)
@@ -46,35 +46,35 @@ private val LeafGreen = Color(0xFF3F7A22)
 private val LightColors = lightColorScheme(
     primary = FurOrange,
     onPrimary = FurInk,
-    primaryContainer = Color(0xFFFFE3CC),
+    primaryContainer = Color(0xFFFFE7D4),
     onPrimaryContainer = Color(0xFF5C2A00),
 
     secondary = LensTeal,
     onSecondary = Color(0xFFFFFFFF),
-    secondaryContainer = Color(0xFFCDEEF5),
+    secondaryContainer = Color(0xFFDCF0F6),
     onSecondaryContainer = Color(0xFF00323F),
 
     tertiary = LeafGreen,
     onTertiary = Color(0xFFFFFFFF),
-    tertiaryContainer = Color(0xFFD6F2C4),
+    tertiaryContainer = Color(0xFFE1F5D4),
     onTertiaryContainer = Color(0xFF123D00),
 
-    background = Color(0xFFFFF8F2),
-    onBackground = Color(0xFF3A2A1E),
-    surface = Color(0xFFFFF8F2),
-    onSurface = Color(0xFF3A2A1E),
-    surfaceVariant = Color(0xFFFAE7D8),
-    onSurfaceVariant = Color(0xFF7A6252),
-    // The reply card. Plain white on the cream ground is what separates the
-    // two speakers; the previous pairing put a tinted card next to a tinted
-    // bubble and both read as the same voice.
+    // Lighter than the cream this started as. Flat design leans on near-white
+    // ground and lets one saturated colour do the work; the old surfaces were
+    // tinted enough that the whole app read as beige.
+    background = Color(0xFFFAF6F2),
+    onBackground = Color(0xFF2E1B10),
+    surface = Color(0xFFFAF6F2),
+    onSurface = Color(0xFF2E1B10),
+    surfaceVariant = Color(0xFFF1EBE5),
+    onSurfaceVariant = Color(0xFF7A6A5E),
     surfaceContainerLow = Color(0xFFFFFFFF),
-    surfaceContainer = Color(0xFFFDF0E6),
-    surfaceContainerHigh = Color(0xFFF9E9DC),
-    surfaceContainerHighest = Color(0xFFF6E3D2),
+    surfaceContainer = Color(0xFFF7F2EC),
+    surfaceContainerHigh = Color(0xFFF2ECE5),
+    surfaceContainerHighest = Color(0xFFEDE5DD),
 
-    outline = Color(0xFFA07B60),
-    outlineVariant = Color(0xFFEBD5C3),
+    outline = Color(0xFFA08D7E),
+    outlineVariant = Color(0xFFE8E0D8),
 
     error = Color(0xFFC1272D),
     onError = Color(0xFFFFFFFF),

@@ -18,7 +18,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -88,15 +87,9 @@ fun MascotBadge(
     Box(
         modifier = modifier
             .size(size)
-            .background(
-                brush = Brush.radialGradient(
-                    listOf(
-                        scheme.primaryContainer,
-                        scheme.primaryContainer.copy(alpha = 0f),
-                    )
-                ),
-                shape = CircleShape,
-            ),
+            // A flat disc, not a gradient glow: the mark is flat, and a soft
+            // halo behind it was the one place the two styles disagreed.
+            .background(scheme.primaryContainer.copy(alpha = 0.5f), CircleShape),
         contentAlignment = Alignment.Center,
     ) {
         Mascot(size = size * 0.72f, modifier = Modifier.scale(scale))
