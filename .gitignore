@@ -33,3 +33,7 @@ keystore.properties
 
 # Built APKs handed out for sideloading are artifacts, not source.
 dist/
+
+# Python bytecode from the design scripts
+__pycache__/
+*.pyc
