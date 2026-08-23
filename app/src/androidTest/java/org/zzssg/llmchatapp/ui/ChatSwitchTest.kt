@@ -137,9 +137,21 @@ class ChatSwitchTest {
         assertEquals("the old chat must not have grown", 2, onScreen.size)
         assertEquals("Say hello.", onScreen.first().text)
 
-        val stored = runBlocking { chatStore.load(answeringChatId) }
-        assertTrue("the answer should be on disk under its own chat", stored != null)
-        val reply = requireNotNull(stored).messages.last()
+        // Waiting for generation to stop is not waiting for the file. The
+        // ViewModel clears isGenerating in its finally block and only then calls
+        // persistChat, which does the load-and-save from a coroutine of its own,
+        // so the store is still being written when the flag says the answer is
+        // done. Reading it straight after the flag is a race the test loses on a
+        // slow device -- and reports as "the answer should be on disk", which
+        // reads like the reply was dropped rather than merely not written yet.
+        //
+        // What the fix is for is still asserted: the wait fails on its timeout
+        // if the answer is never filed, and the chat it is filed under is the
+        // one the question was asked in, not the one on screen.
+        val stored = await("the answer to reach the store under its own chat") {
+            chatStore.load(answeringChatId)
+        }
+        val reply = stored.messages.last()
         assertEquals(org.zzssg.llmchatapp.llm.ChatTurn.ROLE_ASSISTANT, reply.role)
         assertTrue("the stored answer should not be empty", reply.text.isNotBlank())
     }
@@ -152,7 +164,7 @@ class ChatSwitchTest {
     }
 
     /** Polls [probe] until it returns non-null. Generation here is genuinely slow. */
-    private fun <T : Any> await(what: String, probe: () -> T?): T = runBlocking {
+    private fun <T : Any> await(what: String, probe: suspend () -> T?): T = runBlocking {
         withTimeoutOrNull(TIMEOUT_MS) {
             while (true) {
                 probe()?.let { return@withTimeoutOrNull it }
