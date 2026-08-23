@@ -6,5 +6,5 @@
         Matching this to the Compose light background stops the white flash
         between the launch window and the first frame.
     -->
-    <color name="launch_background">#FAFDFB</color>
+    <color name="launch_background">#FAF6F2</color>
 </resources>

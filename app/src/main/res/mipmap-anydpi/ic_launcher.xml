@@ -3,8 +3,10 @@
     <background android:drawable="@drawable/ic_launcher_background" />
     <foreground android:drawable="@drawable/ic_launcher_foreground" />
     <!--
-        Themed icon for Android 13+. The system tints this single drawable, which
-        is why the foreground uses evenOdd holes rather than painted-on details.
+        Themed icon for Android 13+. The system flattens this to one colour, and
+        the coloured foreground flattens to a blob: the lens stops being a hole
+        and the eye stops being an eye. This is the glass on its own, which is
+        the part that still says what the app is without colour.
     -->
-    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
 </adaptive-icon>

@@ -34,7 +34,7 @@ import androidx.compose.ui.unit.sp
  */
 
 /** Squirrel fur, the same value the mascot is drawn in. */
-private val FurOrange = Color(0xFFF2711C)
+private val FurOrange = Color(0xFFEE7F44)
 private val FurInk = Color(0xFF2E1B10)
 
 /** The lens: what the app has figured out -- reasoning, model info, stats. */
