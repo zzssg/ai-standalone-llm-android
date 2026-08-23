@@ -14,6 +14,22 @@ if (keystorePropertiesFile.exists()) {
     keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
 }
 
+// Runtime CPU dispatch: on for release, off for debug, and -PllmRuntimeDispatch
+// overrides either way (`=1` to profile it in a debug build, `=0` to cut a
+// release back to one baseline).
+//
+// Release wants it because the useful ARM instructions are optional: one
+// baseline either excludes the phones below it -- with SIGILL at the first
+// matmul -- or gives up the instructions that make quantised inference fast on
+// the phones above it. Debug does not, because it builds two ABIs and would
+// compile the CPU backend seven times for one and fourteen for the other, to
+// produce kernels it deliberately leaves unoptimised anyway.
+def runtimeDispatch = { boolean onByDefault ->
+    project.hasProperty('llmRuntimeDispatch')
+        ? project.property('llmRuntimeDispatch').toString()
+        : (onByDefault ? '1' : '0')
+}
+
 android {
     namespace 'org.zzssg.llmchatapp'
     compileSdk 36
@@ -31,8 +47,8 @@ android {
         // and llama.cpp's C++17 usage needs a modern libc++ anyway.
         minSdk 26
         targetSdk 36
-        versionCode 21
-        versionName "3.4.0"
+        versionCode 22
+        versionName "3.4.1"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
@@ -90,10 +106,26 @@ android {
             ndk {
                 abiFilters 'x86_64'
             }
+
+            externalNativeBuild {
+                cmake {
+                    arguments "-DLLM_RUNTIME_DISPATCH=${runtimeDispatch(false)}"
+                }
+            }
         }
         release {
             minifyEnabled true
             shrinkResources true
+
+            // One APK for every arm64 phone. ggml builds the CPU backend once
+            // per feature set and the device loads the best one it can run, so
+            // i8mm is used where it exists and nothing is executed where it
+            // does not. See the comment in src/main/cpp/CMakeLists.txt.
+            externalNativeBuild {
+                cmake {
+                    arguments "-DLLM_RUNTIME_DISPATCH=${runtimeDispatch(true)}"
+                }
+            }
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             if (keystoreProperties.containsKey('storeFile')) {
                 signingConfig signingConfigs.release

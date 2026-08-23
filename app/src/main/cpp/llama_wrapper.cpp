@@ -7,6 +7,7 @@
 
 #include <jni.h>
 #include <android/log.h>
+#include <dlfcn.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
@@ -622,6 +623,101 @@ std::string read_gguf_architecture(const char * path) {
 
 
 // Number of cores in the fastest frequency tier.
+#ifdef GGML_BACKEND_DL
+// Pick the CPU backend the phone can actually run.
+//
+// Under runtime dispatch there is no CPU backend inside libggml.so: ggml built
+// one shared module per feature set, and nothing is registered until one of
+// them is loaded. Loading the wrong one is the whole problem this solves -- a
+// module built with i8mm meets an illegal instruction on a CPU without it -- so
+// each module exports ggml_backend_score(), which reads HWCAP and returns 0
+// when the CPU lacks any feature the module was compiled for, and otherwise a
+// value that grows with the feature set. Scoring touches none of the kernels,
+// so a module can be safely opened, questioned and dropped again on hardware
+// that cannot run a single one of its instructions.
+//
+// This is what ggml_backend_load_best() does, and it is reimplemented here for
+// one reason: load_best() finds its candidates by listing a directory. This APK
+// sets useLegacyPackaging false, so the libraries are never unpacked -- they are
+// mapped straight out of the APK, and their directory is a path of the form
+// `/data/app/../base.apk!/lib/arm64-v8a`, which dlopen() understands and
+// directory_iterator does not. The candidates therefore have to be named, and
+// the names are the ones ggml's own CMakeLists gives its variants.
+const char * const kCpuVariants[] = {
+#if defined(__aarch64__)
+    "libggml-cpu-android_armv8.0_1.so",
+    "libggml-cpu-android_armv8.2_1.so",
+    "libggml-cpu-android_armv8.2_2.so",
+    "libggml-cpu-android_armv8.6_1.so",
+    "libggml-cpu-android_armv9.0_1.so",
+    "libggml-cpu-android_armv9.2_1.so",
+    "libggml-cpu-android_armv9.2_2.so",
+#elif defined(__x86_64__)
+    // The emulator ABI. Correctness only -- see the abiFilters comment in
+    // app/build.gradle -- but it has to have a backend at all, or every
+    // instrumented test fails with "no backends are loaded".
+    "libggml-cpu-x64.so",
+    "libggml-cpu-sse42.so",
+    "libggml-cpu-sandybridge.so",
+    "libggml-cpu-ivybridge.so",
+    "libggml-cpu-piledriver.so",
+    "libggml-cpu-haswell.so",
+    "libggml-cpu-alderlake.so",
+    "libggml-cpu-skylakex.so",
+    "libggml-cpu-cannonlake.so",
+    "libggml-cpu-cascadelake.so",
+    "libggml-cpu-icelake.so",
+    "libggml-cpu-cooperlake.so",
+    "libggml-cpu-zen4.so",
+    "libggml-cpu-sapphirerapids.so",
+#endif
+};
+
+void load_best_cpu_backend() {
+    // Our own path, which is the only reliable way to name that directory.
+    // ApplicationInfo.nativeLibraryDir is the documented answer and the wrong
+    // one here: with the libraries left inside the APK it names a directory
+    // that holds none of them.
+    Dl_info info = {};
+    if (dladdr((const void *) &load_best_cpu_backend, &info) == 0 || info.dli_fname == nullptr) {
+        LOGE("cannot locate own library; no CPU backend will be available");
+        return;
+    }
+
+    std::string dir(info.dli_fname);
+    const size_t cut = dir.find_last_of('/');
+    dir = (cut == std::string::npos) ? std::string(".") : dir.substr(0, cut);
+
+    // Highest score wins, rather than the first module that loads. Scores are
+    // built from the feature bits, so ordering the list by capability would
+    // usually give the same answer -- but only usually, and only as long as
+    // whoever edits the list keeps it sorted. Asking every candidate costs a
+    // handful of mmaps once per process and owes nothing to the order.
+    int best_score = 0;
+    std::string best_path;
+    for (const char * name : kCpuVariants) {
+        const std::string path = dir + "/" + name;
+        void * handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (handle == nullptr) {
+            continue;
+        }
+        auto score_fn = (int (*)()) dlsym(handle, "ggml_backend_score");
+        const int score = score_fn ? score_fn() : 1;
+        dlclose(handle);
+        if (score > best_score) {
+            best_score = score;
+            best_path  = path;
+        }
+    }
+
+    if (best_score == 0 || ggml_backend_load(best_path.c_str()) == nullptr) {
+        LOGE("no CPU backend in %s is supported by this device", dir.c_str());
+        return;
+    }
+    LOGI("CPU backend: %s (score %d)", best_path.c_str() + dir.size() + 1, best_score);
+}
+#endif  // GGML_BACKEND_DL
+
 //
 // Inference threads run in lockstep and synchronise at every layer, so a thread
 // on a slow core stalls all the others. What matters is therefore how many
@@ -766,6 +862,13 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
     g_mtp_pending_h.clear();
     g_mtp_verify_h.clear();
     g_mtp_verify_rows = 0;
+
+#ifdef GGML_BACKEND_DL
+    // Before llama_backend_init(), which expects a registry with something in
+    // it. Once: the registry keeps the module loaded for the process lifetime.
+    static std::once_flag cpu_backend_once;
+    std::call_once(cpu_backend_once, load_best_cpu_backend);
+#endif
 
     llama_backend_init();
     llama_log_set(ggml_log_to_logcat, nullptr);
