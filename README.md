@@ -172,6 +172,12 @@ before any of it is worth writing.
 - [`docs/voice-input.md`](docs/voice-input.md) — on-device dictation with
   whisper.cpp built against the ggml already in the tree, and why the platform
   speech recogniser is not an option for an app with no `INTERNET` permission.
+- [`docs/dictation-app.md`](docs/dictation-app.md) — **a separate application,
+  not a feature of this one.** A standalone dictation utility: transcript to the
+  clipboard, a searchable buffer of everything recognised, and background capture
+  with configurable start and stop. It is filed here because it stands on the
+  same whisper.cpp and ggml groundwork, and it should move to a repository of its
+  own once there is code under it.
 
 ## License
 
