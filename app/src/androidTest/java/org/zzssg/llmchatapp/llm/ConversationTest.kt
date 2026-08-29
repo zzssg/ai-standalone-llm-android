@@ -197,6 +197,32 @@ class ConversationTest {
         )
     }
 
+    @Test
+    fun secondTurnIsCoherentAfterTheFirstHitsItsTokenLimit() = runBlocking {
+        engine.load(modelFile, contextSize = 1024)
+        engine.applySampling(config)
+
+        val first = engine.reply(
+            ChatTurn(ChatTurn.ROLE_SYSTEM, SYSTEM_PROMPT),
+            ChatTurn(ChatTurn.ROLE_USER, "Count from one to fifty."),
+            with = config.copy(maxTokens = 1),
+        )
+        assertEquals("the first reply must exercise the hard limit", 1, first.tokenCount)
+
+        val second = engine.reply(
+            ChatTurn(ChatTurn.ROLE_SYSTEM, SYSTEM_PROMPT),
+            ChatTurn(ChatTurn.ROLE_USER, "Count from one to fifty."),
+            ChatTurn(ChatTurn.ROLE_ASSISTANT, first.text),
+            ChatTurn(ChatTurn.ROLE_USER, "Now name one colour."),
+        )
+
+        assertTrue("second reply should generate tokens", second.tokenCount > 0)
+        assertTrue(
+            "second reply should remain readable after prefix reuse, got: ${second.text.take(120)}",
+            second.text.isReadableText(),
+        )
+    }
+
     // -- helpers ------------------------------------------------------------
 
     private data class Reply(val text: String, val tokenCount: Int)

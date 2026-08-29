@@ -156,6 +156,31 @@ class ChatSwitchTest {
         assertTrue("the stored answer should not be empty", reply.text.isNotBlank())
     }
 
+    @Test
+    fun deletingAnAnsweringChatDoesNotLetItsFinalSaveRecreateIt() {
+        onMain { viewModel.send("Count slowly from one to fifty, one number per line.") }
+        val chatId = await("the new chat to get an id") {
+            viewModel.state.value.activeChatId
+        }
+        await("the answer to start") {
+            viewModel.state.value.messages.lastOrNull()?.text?.takeIf { it.isNotEmpty() }
+        }
+
+        onMain { viewModel.deleteChat(chatId) }
+        await("generation and deletion to finish") {
+            true.takeIf {
+                !viewModel.state.value.isGenerating &&
+                    viewModel.state.value.activeChatId != chatId
+            }
+        }
+
+        // Give any incorrectly detached persistence coroutine time to finish;
+        // the old implementation could save after deleteChat returned.
+        runBlocking { delay(500) }
+        assertEquals(null, runBlocking { chatStore.load(chatId) })
+        assertFalse(runBlocking { chatStore.list() }.any { it.id == chatId })
+    }
+
     // -- helpers ------------------------------------------------------------
 
     /** The ViewModel and its scope both live on the main thread. */

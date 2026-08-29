@@ -834,6 +834,30 @@ std::string take_log_errors() {
     return out;
 }
 
+// Tears down the process-global inference state in dependency order.
+//
+// The MTP context shares g_model with the target context, so it must be freed
+// before the model. Keeping this in one helper also prevents load-error paths
+// from leaking whichever subset had already been created.
+void destroy_model_locked() {
+    g_model_loaded.store(false);
+
+    if (g_sampler) { llama_sampler_free(g_sampler); g_sampler = nullptr; }
+    if (g_ctx_mtp) { llama_free(g_ctx_mtp);         g_ctx_mtp = nullptr; }
+    if (g_ctx)     { llama_free(g_ctx);             g_ctx     = nullptr; }
+    if (g_model)   { llama_model_free(g_model);     g_model   = nullptr; }
+
+    g_cached_tokens.clear();
+    g_mtp_draft = 0;
+    g_mtp_n_embd = 0;
+    g_mtp_pending_h.clear();
+    g_mtp_verify_h.clear();
+    g_mtp_verify_rows = 0;
+    g_mtp_ms_draft = 0.0;
+    g_mtp_ms_target = 0.0;
+    g_mtp_ms_follow = 0.0;
+}
+
 } // namespace
 
 // ===========================================================================
@@ -851,17 +875,8 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
 
     std::lock_guard<std::mutex> guard(g_lock);
 
-    // Loading a second model used to overwrite the globals and leak the first.
-    if (g_sampler) { llama_sampler_free(g_sampler); g_sampler = nullptr; }
-    if (g_ctx_mtp) { llama_free(g_ctx_mtp);         g_ctx_mtp = nullptr; }
-    if (g_ctx)     { llama_free(g_ctx);             g_ctx     = nullptr; }
-    if (g_model)   { llama_model_free(g_model);     g_model   = nullptr; }
-    g_model_loaded.store(false);
-    g_cached_tokens.clear();
-    g_mtp_draft = 0;
-    g_mtp_pending_h.clear();
-    g_mtp_verify_h.clear();
-    g_mtp_verify_rows = 0;
+    // Loading a second model replaces every context that refers to the first.
+    destroy_model_locked();
 
 #ifdef GGML_BACKEND_DL
     // Before llama_backend_init(), which expects a registry with something in
@@ -953,8 +968,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
 
     g_ctx = llama_init_from_model(g_model, cparams);
     if (!g_ctx) {
-        llama_model_free(g_model);
-        g_model = nullptr;
+        destroy_model_locked();
         return utf8_to_jstring(env,
             "E_CONTEXT|Not enough memory to open this model. Try a smaller model or a shorter context.");
     }
@@ -965,8 +979,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
 
     rebuild_sampler_locked();
     if (!g_sampler) {
-        llama_free(g_ctx);         g_ctx   = nullptr;
-        llama_model_free(g_model); g_model = nullptr;
+        destroy_model_locked();
         return utf8_to_jstring(env, "E_SAMPLER|Could not initialise the sampler.");
     }
 
@@ -981,11 +994,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeUnloadModel(JNIEnv *, jclass) {
     g_stop_requested.store(true);
     std::lock_guard<std::mutex> guard(g_lock);
 
-    g_model_loaded.store(false);
-    if (g_sampler) { llama_sampler_free(g_sampler); g_sampler = nullptr; }
-    if (g_ctx)     { llama_free(g_ctx);             g_ctx     = nullptr; }
-    if (g_model)   { llama_model_free(g_model);     g_model   = nullptr; }
-    g_cached_tokens.clear();
+    destroy_model_locked();
     g_stop_requested.store(false);
     LOGI("model unloaded");
 }
@@ -1267,11 +1276,13 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
     int         n_generated = 0;
     int         n_past      = (int) tokens.size();
 
-    const bool speculative = g_ctx_mtp != nullptr && g_mtp_draft > 0;
+    bool speculative = g_ctx_mtp != nullptr && g_mtp_draft > 0;
     if (speculative) {
         // Mirror the prompt into the draft head so it starts from the same state.
         if (!mtp_follow_target(tail, (int) common)) {
             LOGW("MTP could not follow the prompt, generating without it");
+            mtp_reset_locked();
+            speculative = false;
         }
     }
 
@@ -1280,8 +1291,9 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
     int  n_drafted  = 0;
     int  n_accepted = 0;
     bool stop       = false;
+    bool last_emitted_committed = true;
 
-    auto emit = [&](llama_token id) {
+    auto emit = [&](llama_token id, bool committed) {
         llama_sampler_accept(g_sampler, id);
 
         if (llama_vocab_is_eog(vocab, id)) {
@@ -1297,6 +1309,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
         }
 
         g_cached_tokens.push_back(id);
+        last_emitted_committed = committed;
         ++n_generated;
     };
 
@@ -1310,7 +1323,9 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
             break;
         }
 
-        emit(id);
+        // This token produced the current logits, but is not resident in the KV
+        // cache until the decode below succeeds.
+        emit(id, /*committed=*/ false);
         if (stop || n_generated >= (int) maxTokens) break;
 
         if (n_past >= n_ctx - 1) {
@@ -1325,6 +1340,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
                 LOGE("decode failed at position %d", n_past);
                 break;
             }
+            last_emitted_committed = true;
             ++n_past;
             id = llama_sampler_sample(g_sampler, g_ctx, -1);
             continue;
@@ -1352,9 +1368,10 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
             LOGE("speculative decode failed at position %d", n_past);
             break;
         }
+        last_emitted_committed = true;
         g_mtp_ms_target += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
             std::chrono::steady_clock::now() - t_verify).count();
-        mtp_follow_target(run, n_past);
+        const bool draft_followed = mtp_follow_target(run, n_past);
         n_drafted += (int) draft.size();
 
         // Walk the guesses. Row j holds the distribution for the token that
@@ -1384,7 +1401,9 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
             }
 
             if (j < draft.size() && sampled == draft[j]) {
-                emit(sampled);
+                // The target decoded the whole speculative run before any
+                // accepted draft token is exposed to the UI.
+                emit(sampled, /*committed=*/ true);
                 ++accepted;
                 if (stop || n_generated >= (int) maxTokens) break;
                 continue;
@@ -1408,9 +1427,17 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
             // happened -- after which its guesses are worthless, which is
             // exactly what a near-zero acceptance rate looks like.
             llama_memory_seq_rm(mem, 0, (llama_pos) n_past, -1);
-            llama_memory_seq_rm(llama_get_memory(g_ctx_mtp), 0, (llama_pos) n_past, -1);
+            if (draft_followed) {
+                llama_memory_seq_rm(llama_get_memory(g_ctx_mtp), 0, (llama_pos) n_past, -1);
+            }
         }
-        mtp_commit(accepted);
+        if (draft_followed) {
+            mtp_commit(accepted);
+        } else {
+            LOGW("MTP lost synchronization, generating the rest without it");
+            mtp_reset_locked();
+            speculative = false;
+        }
 
         if (stop || n_generated >= (int) maxTokens) break;
         id = next;
@@ -1418,6 +1445,14 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
 
     if (!pending.empty()) {
         cb.token(pending); // flush the tail even if it is malformed
+    }
+
+    // A token can be visible without having been fed back into the model when
+    // the token limit, context boundary, or a decode error ends the loop. Do not
+    // advertise that token as a reusable KV prefix; the next turn will decode it
+    // again as part of its divergent tail.
+    if (!last_emitted_committed && !g_cached_tokens.empty()) {
+        g_cached_tokens.pop_back();
     }
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(

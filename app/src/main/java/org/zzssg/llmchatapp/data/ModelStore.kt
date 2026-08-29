@@ -89,7 +89,7 @@ class ModelStore(private val context: Context) {
             }
         }
 
-        val target = File(root, sanitize(name))
+        val target = File(root, sanitizeModelFilename(name))
         val partial = File(root, "${target.name}.part")
         partial.delete()
 
@@ -159,21 +159,32 @@ class ModelStore(private val context: Context) {
         return stat.availableBlocksLong * stat.blockSizeLong
     }
 
-    /** Display names come from an untrusted provider, so strip anything path-like. */
-    private fun sanitize(name: String): String =
-        name.substringAfterLast('/')
-            .substringAfterLast('\\')
-            .replace(Regex("""[^A-Za-z0-9._-]"""), "_")
-            .take(MAX_FILENAME_LENGTH)
-            .ifEmpty { "model$GGUF_EXTENSION" }
-
     private companion object {
-        const val GGUF_EXTENSION = ".gguf"
         const val COPY_BUFFER_BYTES = 1 shl 16
         const val PROGRESS_STEP_BYTES = 4L shl 20
         const val FREE_SPACE_MARGIN_BYTES = 256L shl 20
-        const val MAX_FILENAME_LENGTH = 120
     }
+}
+
+/**
+ * Turns an untrusted provider display name into a stable library filename.
+ *
+ * The extension is appended after truncating the stem. Truncating the complete
+ * name used to remove `.gguf` from long names, after which [ModelStore.list]
+ * could no longer discover the successfully imported model.
+ */
+internal fun sanitizeModelFilename(name: String): String {
+    val leaf = name.substringAfterLast('/').substringAfterLast('\\')
+    val rawStem = if (leaf.endsWith(GGUF_EXTENSION, ignoreCase = true)) {
+        leaf.dropLast(GGUF_EXTENSION.length)
+    } else {
+        leaf
+    }
+    val stem = rawStem
+        .replace(Regex("""[^A-Za-z0-9._-]"""), "_")
+        .take(MAX_FILENAME_LENGTH - GGUF_EXTENSION.length)
+        .ifEmpty { "model" }
+    return stem + GGUF_EXTENSION
 }
 
 /**
@@ -188,3 +199,6 @@ fun formatBytes(bytes: Long, locale: Locale = Locale.getDefault()): String = whe
     bytes >= 1L shl 10 -> String.format(locale, "%.0f KB", bytes / (1L shl 10).toDouble())
     else -> "$bytes B"
 }
+
+private const val GGUF_EXTENSION = ".gguf"
+private const val MAX_FILENAME_LENGTH = 120
