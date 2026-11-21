@@ -4,6 +4,7 @@ import android.util.Log
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -57,6 +58,23 @@ class MtpSetupTest {
 
         assertEquals("MTP must stay off when not asked for", 0, loaded.mtpDraft)
         assertTrue("the model itself should still be usable", loaded.contextSize > 0)
+    }
+
+    @Test
+    fun mtpContextCanBeUnloadedBeforeTheModelIsReopened(): Unit = runBlocking {
+        val model = File(MODEL_PATH)
+        assumeTrue("No model at $MODEL_PATH", model.isFile)
+        assumeTrue("Native library unavailable on this ABI", engine.isAvailable)
+
+        val speculative = engine.load(model, contextSize = 512, mtpDraft = DRAFT)
+        assumeTrue("This model ships no MTP block", speculative.mtpDraft > 0)
+
+        engine.unload()
+        assertFalse("unload should clear the process-global model", engine.isModelLoaded)
+
+        val reopened = engine.load(model, contextSize = 512, mtpDraft = 0)
+        assertEquals(0, reopened.mtpDraft)
+        assertTrue("the reopened target context should be usable", reopened.contextSize > 0)
     }
 
     /** What the extra context actually costs, so the trade-off is a number. */

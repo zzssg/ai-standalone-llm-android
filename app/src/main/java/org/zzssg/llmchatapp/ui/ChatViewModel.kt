@@ -6,11 +6,16 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import android.app.ActivityManager
 import android.content.Context
 import org.zzssg.llmchatapp.data.AppSettings
@@ -172,6 +177,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private var generationJob: Job? = null
 
+    /** Serialises chat files and deletion so a late save cannot recreate one. */
+    private val persistenceMutex = Mutex()
+
+    /** Tombstones are process-local because chat ids are never reused. */
+    private val deletedChatIds = mutableSetOf<String>()
+
     /** Non-null while an answer is being written; see [LiveReply]. */
     private var liveReply: LiveReply? = null
 
@@ -227,10 +238,22 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteChat(id: String) {
         viewModelScope.launch {
+            // Mark first: a persistence coroutine that is waiting for the mutex
+            // must see the deletion before it gets a chance to write.
+            deletedChatIds += id
+
             // A reply being written into a chat that no longer exists has nowhere
             // to land, so this is one of the few places that really must cancel.
-            if (liveReply?.chatId == id) stopGeneration()
-            chatStore.delete(id)
+            if (liveReply?.chatId == id) {
+                val jobToJoin = generationJob
+                stopGeneration()
+                // Its NonCancellable finally block owns the last persistence
+                // attempt. Wait for that block before deleting the file.
+                jobToJoin?.join()
+            }
+            persistenceMutex.withLock {
+                chatStore.delete(id)
+            }
             if (_state.value.activeChatId == id) {
                 startNewChat()
             }
@@ -260,11 +283,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * worth keeping when it has an answer in it, and rewriting the file per token
      * would be pointless I/O.
      */
-    private fun persistChat(chatId: String, transcript: List<ChatMessage>) {
+    private suspend fun persistChat(chatId: String, transcript: List<ChatMessage>) {
         val messages = transcript.filter { it.text.isNotBlank() }
         if (messages.isEmpty()) return
 
-        viewModelScope.launch {
+        persistenceMutex.withLock {
+            if (chatId in deletedChatIds) return
+
             val now = System.currentTimeMillis()
             val existing = chatStore.load(chatId)
 
@@ -426,7 +451,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun send(text: String) {
         val prompt = text.trim()
-        if (prompt.isEmpty() || _state.value.isGenerating || !_state.value.isReady) return
+        if (prompt.isEmpty() || generationJob != null || !_state.value.isReady) return
 
         val userMessage = ChatMessage(role = ChatTurn.ROLE_USER, text = prompt)
         val placeholder = ChatMessage(role = ChatTurn.ROLE_ASSISTANT, text = "", streaming = true)
@@ -455,6 +480,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         GenerationService.start(getApplication())
 
         generationJob = viewModelScope.launch {
+            val thisJob = currentCoroutineContext()[Job]
             val builder = StringBuilder()
             try {
                 engine.generate(turns, config).collect { event ->
@@ -512,10 +538,30 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } finally {
                 GenerationService.stop(getApplication())
-                _state.update { it.copy(isGenerating = false) }
                 val transcript = live.messages
                 if (liveReply === live) liveReply = null
-                persistChat(targetChatId, transcript)
+                try {
+                    // Cancellation must still file a stopped partial reply. This
+                    // is structured work, so deleteChat can join it reliably.
+                    withContext(NonCancellable) {
+                        persistChat(targetChatId, transcript)
+                    }
+                } catch (e: Exception) {
+                    if (targetChatId !in deletedChatIds) {
+                        _state.update {
+                            it.copy(
+                                error = UserFacingError(
+                                    title = "Could not save the conversation",
+                                    detail = e.readableMessage(),
+                                )
+                            )
+                        }
+                    }
+                }
+                if (generationJob === thisJob) {
+                    generationJob = null
+                    _state.update { it.copy(isGenerating = false) }
+                }
             }
         }
     }
@@ -525,7 +571,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         GenerationService.stop(getApplication())
         engine.stop()
         generationJob?.cancel()
-        generationJob = null
         liveReply?.settle()
         _state.update { state ->
             state.copy(

@@ -7,6 +7,7 @@
 
 #include <jni.h>
 #include <android/log.h>
+#include <dlfcn.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
@@ -622,6 +623,101 @@ std::string read_gguf_architecture(const char * path) {
 
 
 // Number of cores in the fastest frequency tier.
+#ifdef GGML_BACKEND_DL
+// Pick the CPU backend the phone can actually run.
+//
+// Under runtime dispatch there is no CPU backend inside libggml.so: ggml built
+// one shared module per feature set, and nothing is registered until one of
+// them is loaded. Loading the wrong one is the whole problem this solves -- a
+// module built with i8mm meets an illegal instruction on a CPU without it -- so
+// each module exports ggml_backend_score(), which reads HWCAP and returns 0
+// when the CPU lacks any feature the module was compiled for, and otherwise a
+// value that grows with the feature set. Scoring touches none of the kernels,
+// so a module can be safely opened, questioned and dropped again on hardware
+// that cannot run a single one of its instructions.
+//
+// This is what ggml_backend_load_best() does, and it is reimplemented here for
+// one reason: load_best() finds its candidates by listing a directory. This APK
+// sets useLegacyPackaging false, so the libraries are never unpacked -- they are
+// mapped straight out of the APK, and their directory is a path of the form
+// `/data/app/../base.apk!/lib/arm64-v8a`, which dlopen() understands and
+// directory_iterator does not. The candidates therefore have to be named, and
+// the names are the ones ggml's own CMakeLists gives its variants.
+const char * const kCpuVariants[] = {
+#if defined(__aarch64__)
+    "libggml-cpu-android_armv8.0_1.so",
+    "libggml-cpu-android_armv8.2_1.so",
+    "libggml-cpu-android_armv8.2_2.so",
+    "libggml-cpu-android_armv8.6_1.so",
+    "libggml-cpu-android_armv9.0_1.so",
+    "libggml-cpu-android_armv9.2_1.so",
+    "libggml-cpu-android_armv9.2_2.so",
+#elif defined(__x86_64__)
+    // The emulator ABI. Correctness only -- see the abiFilters comment in
+    // app/build.gradle -- but it has to have a backend at all, or every
+    // instrumented test fails with "no backends are loaded".
+    "libggml-cpu-x64.so",
+    "libggml-cpu-sse42.so",
+    "libggml-cpu-sandybridge.so",
+    "libggml-cpu-ivybridge.so",
+    "libggml-cpu-piledriver.so",
+    "libggml-cpu-haswell.so",
+    "libggml-cpu-alderlake.so",
+    "libggml-cpu-skylakex.so",
+    "libggml-cpu-cannonlake.so",
+    "libggml-cpu-cascadelake.so",
+    "libggml-cpu-icelake.so",
+    "libggml-cpu-cooperlake.so",
+    "libggml-cpu-zen4.so",
+    "libggml-cpu-sapphirerapids.so",
+#endif
+};
+
+void load_best_cpu_backend() {
+    // Our own path, which is the only reliable way to name that directory.
+    // ApplicationInfo.nativeLibraryDir is the documented answer and the wrong
+    // one here: with the libraries left inside the APK it names a directory
+    // that holds none of them.
+    Dl_info info = {};
+    if (dladdr((const void *) &load_best_cpu_backend, &info) == 0 || info.dli_fname == nullptr) {
+        LOGE("cannot locate own library; no CPU backend will be available");
+        return;
+    }
+
+    std::string dir(info.dli_fname);
+    const size_t cut = dir.find_last_of('/');
+    dir = (cut == std::string::npos) ? std::string(".") : dir.substr(0, cut);
+
+    // Highest score wins, rather than the first module that loads. Scores are
+    // built from the feature bits, so ordering the list by capability would
+    // usually give the same answer -- but only usually, and only as long as
+    // whoever edits the list keeps it sorted. Asking every candidate costs a
+    // handful of mmaps once per process and owes nothing to the order.
+    int best_score = 0;
+    std::string best_path;
+    for (const char * name : kCpuVariants) {
+        const std::string path = dir + "/" + name;
+        void * handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (handle == nullptr) {
+            continue;
+        }
+        auto score_fn = (int (*)()) dlsym(handle, "ggml_backend_score");
+        const int score = score_fn ? score_fn() : 1;
+        dlclose(handle);
+        if (score > best_score) {
+            best_score = score;
+            best_path  = path;
+        }
+    }
+
+    if (best_score == 0 || ggml_backend_load(best_path.c_str()) == nullptr) {
+        LOGE("no CPU backend in %s is supported by this device", dir.c_str());
+        return;
+    }
+    LOGI("CPU backend: %s (score %d)", best_path.c_str() + dir.size() + 1, best_score);
+}
+#endif  // GGML_BACKEND_DL
+
 //
 // Inference threads run in lockstep and synchronise at every layer, so a thread
 // on a slow core stalls all the others. What matters is therefore how many
@@ -738,6 +834,30 @@ std::string take_log_errors() {
     return out;
 }
 
+// Tears down the process-global inference state in dependency order.
+//
+// The MTP context shares g_model with the target context, so it must be freed
+// before the model. Keeping this in one helper also prevents load-error paths
+// from leaking whichever subset had already been created.
+void destroy_model_locked() {
+    g_model_loaded.store(false);
+
+    if (g_sampler) { llama_sampler_free(g_sampler); g_sampler = nullptr; }
+    if (g_ctx_mtp) { llama_free(g_ctx_mtp);         g_ctx_mtp = nullptr; }
+    if (g_ctx)     { llama_free(g_ctx);             g_ctx     = nullptr; }
+    if (g_model)   { llama_model_free(g_model);     g_model   = nullptr; }
+
+    g_cached_tokens.clear();
+    g_mtp_draft = 0;
+    g_mtp_n_embd = 0;
+    g_mtp_pending_h.clear();
+    g_mtp_verify_h.clear();
+    g_mtp_verify_rows = 0;
+    g_mtp_ms_draft = 0.0;
+    g_mtp_ms_target = 0.0;
+    g_mtp_ms_follow = 0.0;
+}
+
 } // namespace
 
 // ===========================================================================
@@ -755,17 +875,15 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
 
     std::lock_guard<std::mutex> guard(g_lock);
 
-    // Loading a second model used to overwrite the globals and leak the first.
-    if (g_sampler) { llama_sampler_free(g_sampler); g_sampler = nullptr; }
-    if (g_ctx_mtp) { llama_free(g_ctx_mtp);         g_ctx_mtp = nullptr; }
-    if (g_ctx)     { llama_free(g_ctx);             g_ctx     = nullptr; }
-    if (g_model)   { llama_model_free(g_model);     g_model   = nullptr; }
-    g_model_loaded.store(false);
-    g_cached_tokens.clear();
-    g_mtp_draft = 0;
-    g_mtp_pending_h.clear();
-    g_mtp_verify_h.clear();
-    g_mtp_verify_rows = 0;
+    // Loading a second model replaces every context that refers to the first.
+    destroy_model_locked();
+
+#ifdef GGML_BACKEND_DL
+    // Before llama_backend_init(), which expects a registry with something in
+    // it. Once: the registry keeps the module loaded for the process lifetime.
+    static std::once_flag cpu_backend_once;
+    std::call_once(cpu_backend_once, load_best_cpu_backend);
+#endif
 
     llama_backend_init();
     llama_log_set(ggml_log_to_logcat, nullptr);
@@ -850,8 +968,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
 
     g_ctx = llama_init_from_model(g_model, cparams);
     if (!g_ctx) {
-        llama_model_free(g_model);
-        g_model = nullptr;
+        destroy_model_locked();
         return utf8_to_jstring(env,
             "E_CONTEXT|Not enough memory to open this model. Try a smaller model or a shorter context.");
     }
@@ -862,8 +979,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeLoadModel(
 
     rebuild_sampler_locked();
     if (!g_sampler) {
-        llama_free(g_ctx);         g_ctx   = nullptr;
-        llama_model_free(g_model); g_model = nullptr;
+        destroy_model_locked();
         return utf8_to_jstring(env, "E_SAMPLER|Could not initialise the sampler.");
     }
 
@@ -878,11 +994,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeUnloadModel(JNIEnv *, jclass) {
     g_stop_requested.store(true);
     std::lock_guard<std::mutex> guard(g_lock);
 
-    g_model_loaded.store(false);
-    if (g_sampler) { llama_sampler_free(g_sampler); g_sampler = nullptr; }
-    if (g_ctx)     { llama_free(g_ctx);             g_ctx     = nullptr; }
-    if (g_model)   { llama_model_free(g_model);     g_model   = nullptr; }
-    g_cached_tokens.clear();
+    destroy_model_locked();
     g_stop_requested.store(false);
     LOGI("model unloaded");
 }
@@ -1164,11 +1276,13 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
     int         n_generated = 0;
     int         n_past      = (int) tokens.size();
 
-    const bool speculative = g_ctx_mtp != nullptr && g_mtp_draft > 0;
+    bool speculative = g_ctx_mtp != nullptr && g_mtp_draft > 0;
     if (speculative) {
         // Mirror the prompt into the draft head so it starts from the same state.
         if (!mtp_follow_target(tail, (int) common)) {
             LOGW("MTP could not follow the prompt, generating without it");
+            mtp_reset_locked();
+            speculative = false;
         }
     }
 
@@ -1177,8 +1291,9 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
     int  n_drafted  = 0;
     int  n_accepted = 0;
     bool stop       = false;
+    bool last_emitted_committed = true;
 
-    auto emit = [&](llama_token id) {
+    auto emit = [&](llama_token id, bool committed) {
         llama_sampler_accept(g_sampler, id);
 
         if (llama_vocab_is_eog(vocab, id)) {
@@ -1194,6 +1309,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
         }
 
         g_cached_tokens.push_back(id);
+        last_emitted_committed = committed;
         ++n_generated;
     };
 
@@ -1207,7 +1323,9 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
             break;
         }
 
-        emit(id);
+        // This token produced the current logits, but is not resident in the KV
+        // cache until the decode below succeeds.
+        emit(id, /*committed=*/ false);
         if (stop || n_generated >= (int) maxTokens) break;
 
         if (n_past >= n_ctx - 1) {
@@ -1222,6 +1340,7 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
                 LOGE("decode failed at position %d", n_past);
                 break;
             }
+            last_emitted_committed = true;
             ++n_past;
             id = llama_sampler_sample(g_sampler, g_ctx, -1);
             continue;
@@ -1249,9 +1368,10 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
             LOGE("speculative decode failed at position %d", n_past);
             break;
         }
+        last_emitted_committed = true;
         g_mtp_ms_target += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
             std::chrono::steady_clock::now() - t_verify).count();
-        mtp_follow_target(run, n_past);
+        const bool draft_followed = mtp_follow_target(run, n_past);
         n_drafted += (int) draft.size();
 
         // Walk the guesses. Row j holds the distribution for the token that
@@ -1281,7 +1401,9 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
             }
 
             if (j < draft.size() && sampled == draft[j]) {
-                emit(sampled);
+                // The target decoded the whole speculative run before any
+                // accepted draft token is exposed to the UI.
+                emit(sampled, /*committed=*/ true);
                 ++accepted;
                 if (stop || n_generated >= (int) maxTokens) break;
                 continue;
@@ -1305,9 +1427,17 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
             // happened -- after which its guesses are worthless, which is
             // exactly what a near-zero acceptance rate looks like.
             llama_memory_seq_rm(mem, 0, (llama_pos) n_past, -1);
-            llama_memory_seq_rm(llama_get_memory(g_ctx_mtp), 0, (llama_pos) n_past, -1);
+            if (draft_followed) {
+                llama_memory_seq_rm(llama_get_memory(g_ctx_mtp), 0, (llama_pos) n_past, -1);
+            }
         }
-        mtp_commit(accepted);
+        if (draft_followed) {
+            mtp_commit(accepted);
+        } else {
+            LOGW("MTP lost synchronization, generating the rest without it");
+            mtp_reset_locked();
+            speculative = false;
+        }
 
         if (stop || n_generated >= (int) maxTokens) break;
         id = next;
@@ -1315,6 +1445,14 @@ Java_org_zzssg_llmchatapp_llm_LlamaBridge_nativeGenerate(
 
     if (!pending.empty()) {
         cb.token(pending); // flush the tail even if it is malformed
+    }
+
+    // A token can be visible without having been fed back into the model when
+    // the token limit, context boundary, or a decode error ends the loop. Do not
+    // advertise that token as a reusable KV prefix; the next turn will decode it
+    // again as part of its divergent tail.
+    if (!last_emitted_committed && !g_cached_tokens.empty()) {
+        g_cached_tokens.pop_back();
     }
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(

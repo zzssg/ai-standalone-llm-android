@@ -7,9 +7,9 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
@@ -29,6 +29,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.material3.Icon
 import org.zzssg.llmchatapp.R
 
+/** Below this, [Mascot] draws the head crop rather than the whole figure. */
+private val FIGURE_MIN_SIZE = 40.dp
+
 /**
  * The app's face: a squirrel with a magnifying glass.
  *
@@ -37,6 +40,12 @@ import org.zzssg.llmchatapp.R
  * is the part that looks closely at things. Every screen the user meets before
  * they have a model shows it, so the first impression is a character rather than
  * a grey chip icon.
+ *
+ * It is drawn from two crops of the same geometry, picked by the size asked for.
+ * The whole animal is worth having where it is the hero of the screen, and below
+ * about forty density pixels -- the avatar beside every assistant message -- the
+ * body and the tail are two smudges under the head, so the head is all that gets
+ * drawn there.
  */
 @Composable
 fun Mascot(
@@ -45,7 +54,9 @@ fun Mascot(
     contentDescription: String? = null,
 ) {
     Image(
-        painter = painterResource(R.drawable.ic_squirrel),
+        painter = painterResource(
+            if (size < FIGURE_MIN_SIZE) R.drawable.ic_squirrel_head else R.drawable.ic_squirrel
+        ),
         contentDescription = contentDescription,
         modifier = modifier
             .size(size)
@@ -54,10 +65,11 @@ fun Mascot(
 }
 
 /**
- * The mascot on a soft halo, for the two places it is the hero of the screen.
+ * The mascot in a framed tile, for the two places it is the hero of the screen.
  *
- * The halo does the work a drop shadow would: it lifts the character off a flat
- * background without adding an elevation the rest of the design does not use.
+ * The framed tile makes the character feel like an app mark rather than a
+ * sticker. It uses the same warm hierarchy as the launcher icon without
+ * introducing elevation or a fake drop shadow.
  */
 @Composable
 fun MascotBadge(
@@ -87,9 +99,12 @@ fun MascotBadge(
     Box(
         modifier = modifier
             .size(size)
-            // A flat disc, not a gradient glow: the mark is flat, and a soft
-            // halo behind it was the one place the two styles disagreed.
-            .background(scheme.primaryContainer.copy(alpha = 0.5f), CircleShape),
+            .background(scheme.primaryContainer, RoundedCornerShape(percent = 36))
+            .border(
+                width = 1.dp,
+                color = scheme.outlineVariant,
+                shape = RoundedCornerShape(percent = 36),
+            ),
         contentAlignment = Alignment.Center,
     ) {
         Mascot(size = size * 0.72f, modifier = Modifier.scale(scale))

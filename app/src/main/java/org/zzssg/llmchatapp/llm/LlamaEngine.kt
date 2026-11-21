@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.atomic.AtomicLong
 
 /** One turn of a conversation as the model sees it. */
 data class ChatTurn(val role: String, val content: String) {
@@ -99,6 +100,9 @@ sealed interface GenerationEvent {
  */
 class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
 
+    /** Identifies this facade's claim on the process-global native model. */
+    private val ownerId = nextOwnerId.incrementAndGet()
+
     val isAvailable: Boolean get() = isNativeLibraryAvailable
 
     val isModelLoaded: Boolean
@@ -122,22 +126,34 @@ class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
             throw LlamaException("E_MISSING", "The model file is no longer on this device.")
         }
 
-        val result = nativeLoadModel(file.absolutePath, threads, contextSize, gpuLayers, mtpDraft)
-        if (result != "OK") throw result.toLlamaException()
+        // The JNI layer owns one process-global model. Keep load and the
+        // metadata reads indivisible so a stale ViewModel teardown cannot
+        // unload (or another engine replace) the model in between them.
+        synchronized(nativeLifecycleLock) {
+            val result = nativeLoadModel(file.absolutePath, threads, contextSize, gpuLayers, mtpDraft)
+            nativeOwnerId.set(ownerId)
+            if (result != "OK") throw result.toLlamaException()
 
-        LoadedModel(
-            file = file,
-            description = nativeModelDescription(),
-            contextSize = nativeContextSize(),
-            supportsThinking = nativeSupportsThinking(),
-            mtpDraft = nativeMtpDraft(),
-            params = nativeModelParams(),
-            hasMtpBlock = nativeHasMtpBlock(),
-        )
+            LoadedModel(
+                file = file,
+                description = nativeModelDescription(),
+                contextSize = nativeContextSize(),
+                supportsThinking = nativeSupportsThinking(),
+                mtpDraft = nativeMtpDraft(),
+                params = nativeModelParams(),
+                hasMtpBlock = nativeHasMtpBlock(),
+            )
+        }
     }
 
     suspend fun unload() = withContext(io) {
-        if (isNativeLibraryAvailable) nativeUnloadModel()
+        if (!isNativeLibraryAvailable) return@withContext
+        synchronized(nativeLifecycleLock) {
+            if (nativeOwnerId.get() == ownerId) {
+                nativeUnloadModel()
+                nativeOwnerId.compareAndSet(ownerId, NO_OWNER)
+            }
+        }
     }
 
     suspend fun applySampling(config: SamplingConfig) = withContext(io) {
@@ -227,8 +243,19 @@ class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
      */
     fun releaseAsync() {
         if (!isNativeLibraryAvailable) return
+        // Fast lock-free rejection keeps an obsolete ViewModel from stopping a
+        // newer owner's generation. The second check under the lifecycle lock
+        // closes the race with a new load before the destructive unload.
+        if (nativeOwnerId.get() != ownerId) return
         nativeStop()
-        Thread({ nativeUnloadModel() }, "llama-release").apply {
+        Thread({
+            synchronized(nativeLifecycleLock) {
+                if (nativeOwnerId.get() == ownerId) {
+                    nativeUnloadModel()
+                    nativeOwnerId.compareAndSet(ownerId, NO_OWNER)
+                }
+            }
+        }, "llama-release").apply {
             isDaemon = true
             start()
         }
@@ -241,6 +268,13 @@ class LlamaEngine(private val io: CoroutineDispatcher = Dispatchers.IO) {
                 "This device is not supported: the inference library could not be loaded.",
             )
         }
+    }
+
+    private companion object {
+        const val NO_OWNER = 0L
+        val nextOwnerId = AtomicLong(NO_OWNER)
+        val nativeOwnerId = AtomicLong(NO_OWNER)
+        val nativeLifecycleLock = Any()
     }
 }
 
